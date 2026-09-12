@@ -1,11 +1,15 @@
-"""單體主線 v1.1：接收前段（同學）輸出的 JSON，路由 → KB 檢索 → 撰稿 → 檢查。
+"""單體主線 v1.2：接收前段（同學）輸出的 JSON → 路由 → KB 檢索 → 生成草稿 → 承辦人確認。
 
-流程（草稿模組定案 §2）：
-  前段 JSON → Router(route_key) → analyze_case(KB 檢索 + 健檢)
-            → ★承辦人確認主文★ → finalize_draft(撰稿 + 驗證 + 對抗式審查)
+流程（v1.2 調整：先生成草稿，最後才確認）：
+  前段 JSON → Router(route_key)
+            → analyze_case（KB 檢索：法規 + 相似案例，產生建議主文）
+            → generate_case_draft（用建議主文先生成完整草稿 + 驗證 + 對抗式審查）
+            → ★承辦人審閱草稿並確認主文★
+                 ├─ 維持建議主文 → 直接定稿（0 次額外呼叫）
+                 └─ 改主文 → confirm_disposition 重生理由（+1 次，僅在改動時）
 
 RAG 走 Bedrock KB（路線 A）。所有 LLM / KB 呼叫走 bedrock_client（≤1 RPS）。
-單件呼叫預算約 3–4 次（§5）。
+單件呼叫預算：檢索 1 + 撰稿 1 + 對抗式審查 1–2 ≈ 3–4 次；改主文才 +1。
 """
 
 from __future__ import annotations
@@ -27,7 +31,7 @@ def _query_text(payload: dict) -> str:
 
 
 def analyze_case(payload: dict, client=None) -> dict:
-    """確認主文前的分析：路由 → KB 檢索（法規 + 相似案例）→（健檢由 defects 模組接）。"""
+    """步驟一：路由 → KB 檢索（法規 + 相似案例）→ 產生建議主文。尚未撰稿。"""
     client = client or get_client()
     problems = validate_input(payload)
     if problems:
@@ -48,38 +52,62 @@ def analyze_case(payload: dict, client=None) -> dict:
         "recommended_laws": laws,
         "similar_cases": sims,
         "defects": [],   # TODO: 接 core.defects.health_check（健檢那組）
-        "suggested_disposition": "訴願駁回（建議，待承辦人確認）",
+        "suggested_disposition": _suggest_disposition(sims),
     }
 
 
-def finalize_draft(analysis: dict, confirmed_disposition: str, client=None) -> dict:
-    """承辦人確認主文後：撰稿（1 次）→ 驗證（規則）→ 對抗式審查（1–2 次）。"""
+def generate_case_draft(analysis: dict, disposition: str | None = None, client=None) -> dict:
+    """步驟二：用（建議或指定）主文生成完整草稿，並跑驗證 + 對抗式審查。
+
+    disposition 未指定時採用 analysis 的建議主文。回傳含 draft / verification /
+    adversarial / used_disposition，供承辦人審閱。
+    """
     client = client or get_client()
+    used = disposition or analysis.get("suggested_disposition", "")
     d = draft.generate_draft(
-        analysis["route_key"],
-        confirmed_disposition,
-        analysis["fields"],
-        analysis.get("recommended_laws", []),
-        analysis.get("similar_cases", []),
-        analysis.get("defects", []),
-        client=client,
+        analysis["route_key"], used, analysis["fields"],
+        analysis.get("recommended_laws", []), analysis.get("similar_cases", []),
+        analysis.get("defects", []), client=client,
     )
     report = verify.verify_draft(
         d, analysis["fields"], analysis.get("recommended_laws", []), {}, analysis.get("defects", []),
     )
     review = critic.adversarial_review(d, analysis["fields"], client=client)
-    return {"draft": d, "verification": report, "adversarial": review,
-            "confirmed_disposition": confirmed_disposition}
+    return {"draft": d, "verification": report, "adversarial": review, "used_disposition": used}
+
+
+def confirm_disposition(analysis: dict, draft_result: dict, confirmed_disposition: str, client=None) -> dict:
+    """步驟三：承辦人確認主文。
+
+    - 若確認的主文與生成時用的一致 → 直接定稿，不重生（0 次額外呼叫）。
+    - 若承辦人改了主文 → 重生理由，確保主文與理由一致（+1 次呼叫）。
+    """
+    client = client or get_client()
+    used = draft_result.get("used_disposition", "")
+    if confirmed_disposition == used:
+        return {**draft_result, "confirmed_disposition": confirmed_disposition, "regenerated": False}
+    # 主文被改 → 重生（避免主文理由矛盾）
+    regen = generate_case_draft(analysis, disposition=confirmed_disposition, client=client)
+    return {**regen, "confirmed_disposition": confirmed_disposition, "regenerated": True}
 
 
 def process_case(payload: dict, confirmed_disposition: str | None = None, client=None) -> dict:
-    """端到端便利函式（測試用；正式須由承辦人確認主文）。"""
+    """端到端便利函式（測試用）：分析 → 生成草稿 →（可選）確認主文。"""
     client = client or get_client()
     analysis = analyze_case(payload, client=client)
     if analysis.get("error"):
         return analysis
-    disposition = confirmed_disposition or analysis["suggested_disposition"]
-    return {**analysis, **finalize_draft(analysis, disposition, client=client)}
+    draft_result = generate_case_draft(analysis, client=client)
+    result = {**analysis, **draft_result}
+    if confirmed_disposition is not None:
+        result.update(confirm_disposition(analysis, draft_result, confirmed_disposition, client=client))
+    return result
+
+
+def _suggest_disposition(sims: list[dict]) -> str:
+    """依相似案例主文分布建議主文（僅建議，人保留決定權）。骨架階段先回預設。"""
+    # TODO: 依 sims 的 disposition 分布與 §7 健檢紅燈調整建議
+    return "訴願駁回（建議，待承辦人確認）"
 
 
 def _demo_payload() -> dict:
@@ -95,7 +123,7 @@ def _demo_payload() -> dict:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="ntpc-appeal-ai 單體主線 v1.1")
+    parser = argparse.ArgumentParser(description="ntpc-appeal-ai 單體主線 v1.2")
     parser.add_argument("--dry-run", action="store_true", help="不呼叫真實 Bedrock/KB")
     args = parser.parse_args()
     client = get_client(dry_run=args.dry_run)
