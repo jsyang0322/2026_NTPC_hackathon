@@ -1,0 +1,16 @@
+{
+  "version": "v1",
+  "hooks": [
+    {
+      "name": "core 變更後跑主線 dry-run",
+      "trigger": "PostFileSave",
+      "description": "core/ 底下的檔案存檔後，用 dry-run 跑一次端到端主線，確認串接沒被改壞（不呼叫真實 Bedrock，不吃配額）。",
+      "matcher": "core/.*\\.py$",
+      "action": {
+        "type": "command",
+        "command": "python -m core.pipeline --dry-run > /dev/null && echo \"主線 dry-run 通過\" || echo \"主線 dry-run 失敗，請檢查 core/ 串接\"",
+        "timeout": 120
+      }
+    }
+  ]
+}

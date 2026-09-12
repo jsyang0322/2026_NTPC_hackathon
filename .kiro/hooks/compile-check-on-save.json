@@ -1,0 +1,16 @@
+{
+  "version": "v1",
+  "hooks": [
+    {
+      "name": "Python 存檔編譯檢查",
+      "trigger": "PostFileSave",
+      "description": "存檔任何 .py 後立即編譯檢查，及早抓出語法錯誤與匯入路徑問題。",
+      "matcher": "\\.py$",
+      "action": {
+        "type": "command",
+        "command": "python -m compileall -q core app lambda_handlers pipeline",
+        "timeout": 60
+      }
+    }
+  ]
+}
