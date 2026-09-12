@@ -28,7 +28,7 @@ Retrieve API 有兩種設定形狀，用錯會 ValidationException：
 已知限制：managed store 不支援 startsWith 運算子（實測 ValidationException），
 因此過濾只用 equals / in / orAll / andAll。
 
-dry_run 或未設 KB id 時回 mock，確保骨架可離線跑。
+dry_run 或未設 KB id 時回 mock，確保離線模式可跑。
 """
 
 from __future__ import annotations
@@ -57,6 +57,11 @@ SEARCH_MODE = os.environ.get("BEDROCK_KB_SEARCH_MODE", "auto").strip().lower()
 #: 預設開啟：metadata 尚未補齊的 KB 若硬過濾會全空，整個 Demo 會啞掉；
 #: 代價是這種情況多一次 Retrieve（仍受 ≤1 RPS 閘門保護）。
 FILTER_FALLBACK = os.environ.get("BEDROCK_KB_FILTER_FALLBACK", "1") == "1"
+
+#: KB Retrieve 查詢長度上限。本 KB 用 Cohere Embed，限制以 token 計；實測中文
+#: 約 500 字可過、700 字觸發 ValidationException（中文每字 ≥1 token）。取 500 留邊際。
+#: 真實案卷（原處分書 + 訴願書全文）串起來動輒破千字，故送出前截斷。
+_QUERY_MAX_CHARS = int(os.environ.get("BEDROCK_KB_QUERY_MAX_CHARS", "500"))
 
 #: 探測結果快取：kb_id -> "managed" | "vector"
 _mode_cache: dict[str, str] = {}
@@ -144,6 +149,9 @@ def retrieve(
             "text": f"[DRY_RUN::KB] route={route_key} 的檢索結果（mock）",
             "score": 0.0, "metadata": {"case_type": route_key}, "source": "mock",
         }]
+
+    # 截斷過長查詢：KB Retrieve 有長度上限，真實案卷全文常超過而觸發 ValidationException。
+    query_text = (query_text or "")[:_QUERY_MAX_CHARS]
 
     filt = _build_filter(route_key, doc_types, include_common_law, scoped, filter_case_type)
     hits = _retrieve_raw(kb_id, query_text, num_results, filt)

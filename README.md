@@ -76,6 +76,24 @@ pip install -r requirements.txt
 python -m core.pipeline --dry-run
 ```
 
+### 跑真實流程（呼叫 Bedrock + KB）
+
+```bash
+# 1. AWS 憑證：由 ~/.aws/ 管理（不放專案），確認身分
+aws sts get-caller-identity
+
+# 2. 設定環境變數（範本見 .env.example）
+cp .env.example .env            # 填好後
+set -a; source .env; set +a     # 載入到目前 shell
+
+# 3. 跑（此時 dry-run 關閉、檢索走真實 KB）
+python -m core.pipeline
+```
+
+> ⚠️ **關鍵**：未設定 `BEDROCK_KB_ID` 時，即使關閉 dry-run，RAG 檢索也會
+> **靜默回 mock 而不報錯**——撰稿雖真呼叫 Claude，但沒有真實法規/案例脈絡。
+> 要跑真正的端到端真實流程，務必依 `.env.example` 設好 `BEDROCK_KB_ID`。
+
 ## 競賽規範內建
 
 - Bedrock ≤ 1 RPS：由 `bedrock_client` 全域限流強制

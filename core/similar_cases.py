@@ -82,7 +82,8 @@ def _structure(hit: dict, route_key: str) -> dict:
         "base_score": base,
         "disposition": _disposition(meta, text),
         "shared_issues": _shared_issues(route_key, text),
-        "reasoning_summary": _summarize(text),
+        "reasoning_summary": _summarize(text),   # 短摘要，供 draft prompt（維持精簡）
+        "full_text": " ".join((text or "").split()),  # 完整內文，供 UI 展開顯示
         "route_key": case_route,
         "route_match": route_match,
         "source": source,

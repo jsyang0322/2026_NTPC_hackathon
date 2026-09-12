@@ -43,4 +43,4 @@ second. Generated reports, predictions, and `output_json/` are ignored by Git.
 - `pipeline_two_stage.py`: Nova first pass and Claude review
 - `triage*.py`: earlier baselines retained for comparison
 - `kb_index.json`: prebuilt public-law embedding index used by the workflow
-- `create_bucket.py`, `make_and_upload.py`, `verify_sts.py`: AWS setup helpers
+- `create_bucket.py`, `verify_sts.py`: AWS setup helpers

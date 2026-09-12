@@ -1,6 +1,8 @@
 # === 憑證與機密（競賽規範第 8 點：GitHub 不得含憑證）===
 .env
 .env.*
+# 範本檔不含機密，需提交供隊友參考（gitignore 不支援行內註解，故獨立成行）
+!.env.example
 *.pem
 aws_credentials*
 # 注意：~/.aws/ 在使用者家目錄，本來就不在 repo 內

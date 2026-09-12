@@ -12,6 +12,8 @@
 
 from __future__ import annotations
 
+import re
+
 from .bedrock_client import BedrockClient, get_client
 from . import kb
 from .citations import extract_parsed
@@ -38,26 +40,59 @@ def recommend_laws(
     同一條文被多個段落命中時合併，取最高分並保留第一個來源。
     """
     client = client or get_client()
-    hits = kb.retrieve(
-        query_text=query_text,
-        route_key=route_key,
-        doc_types=["law", "interpretation", "judgment"],
-        include_common_law=True,      # 法規層帶入共通法規（訴願法、行政程序法…）
-        num_results=num_results,
-        client=client,
+
+    # 分層檢索（解法A）：法條與函釋判決分兩批撈。
+    # 原因：單批檢索時，判決/函釋段落的語意常壓過法條本文，把 doc_type=law 擠出
+    # num_results 之外，導致「可引用法條白名單」為空。分層可保證白名單一定有法條。
+    # 兩次檢索各過 throttle（kb.retrieve 內建），呼叫預算 +1。
+    law_hits = kb.retrieve(
+        query_text=query_text, route_key=route_key,
+        doc_types=["law"],            # 含共通法規（include_common_law 會併入 common_law）
+        include_common_law=True,
+        num_results=num_results, client=client, filter_case_type=False,
     )
-    laws = _structure(hits)
+    ref_hits = kb.retrieve(
+        query_text=query_text, route_key=route_key,
+        doc_types=["interpretation", "judgment"],
+        include_common_law=False,     # 參考資料層不再併共通法規
+        num_results=max(num_results // 2, 2), client=client, filter_case_type=False,
+    )
+
+    laws = _structure(law_hits + ref_hits)
     _annotate_status(laws, version_db)
     return laws
+
+
+# 純條號正則（不含法名）：搭配 metadata.law_name 組成乾淨 citation。
+_ARTICLE_RE = re.compile(r"第\s*(\d+)\s*條(?:\s*之\s*(\d+))?")
+
+# 法名可靠、適合組「法名第N條」的 doc_type（法規本文）。
+# interpretation/judgment 的 law_name 是描述性長字串（函釋/判決名），不組條號。
+_LAW_DOC_TYPES = frozenset({"law", "common_law"})
 
 
 def _structure(hits: list[dict]) -> list[dict]:
     """把 KB hits 解析成以條號為單位的清單。
 
-    KB 回的是「段落」，一個段落可能提到多個條文，多個段落也可能提到同一條文，
-    因此需要展開再依 citation 合併。
+    法名來源（方向2，治本）：doc_type=law/common_law 者用 metadata.law_name（乾淨），
+    條號從內文抽數字組成「法名第N條」，避免從破碎的 PDF 內文切法名產生髒資料
+    （如「棄物清理法」「理法」）。函釋/判決不組條號，以摘要形式列入供參考。
     """
     merged: dict[str, dict] = {}
+
+    def _upsert(key, parts, doc_type, score, text, source):
+        existing = merged.get(key)
+        if existing is None:
+            merged[key] = {
+                **parts, "status": "unknown", "doc_type": doc_type,
+                "score": score, "reason": _summarize(text), "source": source,
+            }
+        elif score > existing["score"]:
+            existing["score"] = score
+            existing["reason"] = _summarize(text)
+            if not existing.get("source"):
+                existing["source"] = source
+
     for hit in hits or []:
         if not isinstance(hit, dict):
             continue
@@ -66,27 +101,36 @@ def _structure(hits: list[dict]) -> list[dict]:
         score = _as_float(hit.get("score"))
         source = hit.get("source", "")
         doc_type = str(meta.get("doc_type", "") or "")
+        law_name = str(meta.get("law_name", "") or "").strip()
 
-        for parts in extract_parsed(text):
-            key = parts["citation"]
-            existing = merged.get(key)
-            if existing is None:
-                merged[key] = {
-                    **parts,
-                    "status": "unknown",
-                    "doc_type": doc_type,
-                    "score": score,
-                    "reason": _summarize(text),
-                    "source": source,
+        if doc_type in _LAW_DOC_TYPES and law_name:
+            # 法名用 metadata（乾淨），條號從內文抽數字
+            for m in _ARTICLE_RE.finditer(text):
+                art = int(m.group(1))
+                sub = m.group(2)
+                citation = f"{law_name}第{art}條" + (f"之{int(sub)}" if sub else "")
+                parts = {
+                    "citation": citation, "law": law_name,
+                    "article": str(art), "sub_article": str(int(sub)) if sub else None,
                 }
-            elif score > existing["score"]:
-                # 同條文被更相關的段落命中 → 更新分數與推薦理由
-                existing["score"] = score
-                existing["reason"] = _summarize(text)
-                if not existing.get("source"):
-                    existing["source"] = source
+                _upsert(citation, parts, doc_type, score, text, source)
+        elif doc_type in _LAW_DOC_TYPES:
+            # 法規段落但無 law_name（不預期）：退回內文法名解析
+            for parts in extract_parsed(text):
+                _upsert(parts["citation"], parts, doc_type, score, text, source)
+        else:
+            # 函釋/判決：不組條號，以其名稱為 key 列入供參考
+            name = law_name or _doc_name_from_source(source)
+            if name:
+                _upsert(name, {"citation": name, "law": name,
+                               "article": None, "sub_article": None},
+                        doc_type, score, text, source)
 
     return sorted(merged.values(), key=lambda x: x["score"], reverse=True)
+
+
+def _doc_name_from_source(source: str) -> str:
+    return source.rstrip("/").split("/")[-1] if source else ""
 
 
 def _annotate_status(laws: list[dict], version_db) -> None:

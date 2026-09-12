@@ -1,0 +1,19 @@
+# 鎖定淺色主題，避免使用者/系統的深色模式讓自訂 CSS 撞色（文字看不見）。
+[theme]
+base = "light"
+primaryColor = "#b8860b"
+backgroundColor = "#faf8f3"
+secondaryBackgroundColor = "#f2ece0"
+textColor = "#1a2a4a"
+font = "serif"
+
+[browser]
+gatherUsageStats = false
+
+[client]
+# 隱藏工具列（Deploy 按鈕、漢堡選單等），使用者用不到
+toolbarMode = "minimal"
+
+[server]
+headless = true
+port = 8501

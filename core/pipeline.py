@@ -26,9 +26,22 @@ import argparse
 import json
 from collections import Counter
 
-from . import router, similar_cases, recommend_laws, draft, verify, critic
+from . import (router, similar_cases, recommend_laws, draft, verify, critic,
+               defects as defects_mod, timeline as timeline_mod, procedure,
+               extract as extract_mod, classify as classify_mod, issues as issues_mod)
 from .schemas import build_empty_input, validate_input
 from .bedrock_client import get_client
+
+
+# 中文案由 label → route_key（classify 回中文 case_type，pipeline 內部用英文枚舉）
+_LABEL_TO_ROUTE = {
+    "洗錢防制法": "money_laundering",
+    "廢棄物清理法": "waste",
+    "空氣污染防制法": "air_pollution",
+    "建築法": "building",
+    "噪音管制法": "noise",
+    "其他": "general",
+}
 
 
 # ---------- 主文枚舉（自動判定的三種結果）----------
@@ -45,6 +58,76 @@ def _query_text(payload: dict) -> str:
     return (raw.get("original_disposition_doc", "") + "\n" + raw.get("petition", "") + "\n" + claims).strip()
 
 
+def _public_timeline(timeline: dict) -> dict:
+    """回傳可 JSON 序列化的 timeline：移除內部用的 _parsed（含 date 物件）。
+
+    _parsed 的 date 物件僅供 procedure / defects 內部計算；對外輸出（result → CLI /
+    Lambda / S3 寫檔）只需頂層的顯示字串欄位（皆為 str/None，可序列化）。
+    """
+    return {k: v for k, v in (timeline or {}).items() if k != "_parsed"}
+
+
+# ---------- 前段入口：原始案卷 → 交接契約 payload ----------
+CONFIDENCE_THRESHOLD = 0.5   # 分類信心低於此值標 need_human_review
+
+
+def intake(case_text: dict, case_id: str = "", client=None,
+           with_issues: bool = False) -> dict:
+    """前段全自動入口：原始案卷文字 → 符合交接契約的 payload。
+
+    流程：classify（0 呼叫規則版）→ extract（1 呼叫）→ 組 payload。
+    with_issues=True 時額外呼叫 tag_issues（+1 呼叫），預設關閉以守呼叫預算
+    （主線 extract1+檢索1+撰稿1+法官1=4，重寫最壞6；開 issues 則各 +1）。
+
+    輸入 case_text: {"petition","original_disposition_doc"/"disposition",
+                     "agency_reply_doc"/"reply"}
+    輸出: schemas 交接契約 payload（可直接餵 process_case）。
+    """
+    client = client or get_client()
+
+    # 1) 案由分類（關鍵字規則，0 呼叫）
+    cls = classify_mod.classify_case_type(case_text)
+    label = cls.get("case_type", "其他")
+    route_key = _LABEL_TO_ROUTE.get(label, "general")
+    confidence = float(cls.get("confidence", 0.0) or 0.0)
+
+    # 2) 結構化擷取（1 呼叫）
+    fields = extract_mod.extract_fields(case_text, client=client)
+
+    # 3) 爭點標註（可選，+1 呼叫）
+    if with_issues:
+        tagged = issues_mod.tag_issues(fields, route_key, client=client)
+        fields["issues"] = tagged.get("issues", [])
+
+    # 4) 組交接契約 payload
+    payload = build_empty_input()
+    payload["case_id"] = case_id
+    payload["case_type"] = {
+        "label": label,
+        "route_key": route_key,
+        "confidence": confidence,
+        # 分類信心低於門檻時提示人工確認（仍照常路由與撰稿，不阻斷）
+        "need_human_review": confidence < CONFIDENCE_THRESHOLD,
+    }
+    payload["extracted_fields"] = fields
+    payload["raw_text"] = {
+        "petition": case_text.get("petition", "") or "",
+        "original_disposition_doc": (case_text.get("disposition")
+                                     or case_text.get("original_disposition_doc", "") or ""),
+        "agency_reply_doc": (case_text.get("reply")
+                             or case_text.get("agency_reply_doc", "") or ""),
+    }
+    return payload
+
+
+def process_from_text(case_text: dict, case_id: str = "", client=None,
+                      with_issues: bool = False) -> dict:
+    """端到端全自動（含前段）：原始案卷文字 → intake → process_case。"""
+    client = client or get_client()
+    payload = intake(case_text, case_id=case_id, client=client, with_issues=with_issues)
+    return process_case(payload, client=client)
+
+
 def analyze_case(payload: dict, client=None) -> dict:
     """步驟一：路由 → KB 檢索（法規 + 相似案例）→ 自動判定主文。
 
@@ -58,6 +141,7 @@ def analyze_case(payload: dict, client=None) -> dict:
     route_key = router.resolve_route(payload)
     fields = payload.get("extracted_fields", {})
     admissibility = payload.get("admissibility", {})
+    timeline = timeline_mod.build_timeline(fields)                        # 純規則，不吃配額
 
     base = {
         "case_id": payload.get("case_id"),
@@ -66,28 +150,39 @@ def analyze_case(payload: dict, client=None) -> dict:
         "fields": fields,
     }
 
-    # 快速通道（§10.4）：程序不受理，不進實體審查
-    if not admissibility.get("is_admissible", True):
+    # 程序不受理判定（§10.4 快速通道，0 次 Bedrock 呼叫）：
+    #   1. 前段已於 admissibility 標不受理 → 直接採用
+    #   2. 否則後段以 procedure_check 依 timeline 自行複算（逾期等可程式判定款次）
+    proc = procedure.procedure_check(timeline, fields)
+    front_inadmissible = not admissibility.get("is_admissible", True)
+    if front_inadmissible or proc.get("is_inadmissible"):
+        note = admissibility.get("note", "") if front_inadmissible else (proc.get("reason") or "")
+        basis = ("前段判定程序不受理（快速通道，未進實體審查）" if front_inadmissible
+                 else f"後段程序審查判定不受理（§{proc.get('clause')}）：{proc.get('reason')}")
         return {
             **base,
             "inadmissible": True,
-            "inadmissible_note": admissibility.get("note", ""),
+            "inadmissible_note": note,
+            "procedure": proc,
+            "timeline": _public_timeline(timeline),
             "recommended_laws": [],
             "similar_cases": [],
             "defects": [],
             "decided_disposition": DISPOSITION_INADMISSIBLE,
-            "decision_basis": "前段判定程序不受理（快速通道，未進實體審查）",
+            "decision_basis": basis,
         }
 
     q = _query_text(payload)
     laws = recommend_laws.recommend_laws(route_key, q, client=client)     # KB：法規/函釋/判解
     sims = similar_cases.find_similar(route_key, q, client=client)        # KB：歷史決定書共池
-    defects: list[dict] = []   # TODO: 接 core.defects.health_check（健檢那組）
+    defects = defects_mod.health_check(fields, timeline, client=client)   # 原處分健檢（D1–D6 純規則，0 次呼叫）
 
     disposition, basis = _decide_disposition(sims, defects)
     return {
         **base,
         "inadmissible": False,
+        "procedure": proc,
+        "timeline": _public_timeline(timeline),
         "recommended_laws": laws,
         "similar_cases": sims,
         "defects": defects,
@@ -105,7 +200,8 @@ def generate_case_draft(analysis: dict, disposition: str | None = None,
       2. verify 規則檢查（0 次，純程式，先擋客觀問題並產出 issues）
       3. critic 法官對抗式審查（1 次呼叫）
       4. 規則紅燈或法官指出重大問題 → 帶意見重寫（≤ max_rewrites 次，預設 1）
-      5. 仍不過 → 標 needs_human_review，但仍輸出（全自動不阻斷）
+      5. 重寫後仍有規則層紅燈（issues 非空）→ 標 needs_human_review；
+         法官意見不計入（僅驅動重寫），但仍輸出（全自動不阻斷）
 
     呼叫數：正常 2 次（撰稿 + 法官）；觸發重寫最壞 4 次。加上 analyze 的 KB 檢索 1 次，
     單件合計 3–5 次，守 §13.3 上限。
@@ -114,52 +210,65 @@ def generate_case_draft(analysis: dict, disposition: str | None = None,
     保留此參數供批次重跑或特定案件覆寫，主線不會用到。
     """
     client = client or get_client()
-    used = disposition or analysis.get("decided_disposition", DISPOSITION_DISMISS)
+    # 系統參考主文（多數決/健檢）：初次生成時僅作 LLM 的 fallback 與參考，
+    # 實際主文由 LLM 依事實與法律判斷後回傳（見 draft.generate_draft）。
+    ref_disposition = disposition or analysis.get("decided_disposition", DISPOSITION_DISMISS)
+    ref_note = analysis.get("decision_basis", "")
     fields = analysis.get("fields", {})
     laws = analysis.get("recommended_laws", [])
     sims = analysis.get("similar_cases", [])
     defects = analysis.get("defects", [])
+    timeline = analysis.get("timeline", {})
 
-    # 不受理快速通道：套模板，不呼叫 LLM，也不進審查迴圈
+    # 不受理快速通道：依§77 款次套理由模板，不呼叫 LLM，也不進審查迴圈
     if analysis.get("inadmissible"):
-        d = draft.quick_template({}, {})
-        report = verify.verify_draft(d, fields, laws, {}, defects)
+        d = draft.quick_template(analysis.get("procedure", {}), timeline, fields)
+        report = verify.verify_draft(d, fields, laws, timeline, defects)
+        needs_human = bool(d.get("needs_human_review"))
+        flags = []
+        if needs_human:
+            flags.append("不受理款次無法辨識，套用通用理由，需人工複核")
         return {
             "draft": d,
             "verification": report,
             "adversarial": {"passed": True, "attacks": [], "revocation_risk": "n/a",
                             "note": "不受理案件未進實體審查，不做對抗式審查"},
-            "disposition": used, "decided_by": "auto",
-            "rewrite_count": 0, "needs_human_review": False,
-            "quality_flags": [], "bedrock_calls_estimate": 0,
+            "disposition": ref_disposition, "decided_by": "auto",
+            "rewrite_count": 0, "needs_human_review": needs_human,
+            "quality_flags": flags, "bedrock_calls_estimate": 0,
         }
 
-    # 1) 第一版
-    d = draft.generate_draft(analysis["route_key"], used, fields, laws, sims, defects, client=client)
+    # 1) 第一版：主文由 LLM 依事實/法條/相似案例/健檢判斷（系統參考主文僅作 fallback）
+    d = draft.generate_draft(analysis["route_key"], ref_disposition, fields, laws, sims, defects,
+                             client=client, reference_note=ref_note)
+    used = d.get("disposition") or ref_disposition   # 以 LLM 判定的主文為準
 
     rewrite_count = 0
     while True:
-        report = verify.verify_draft(d, fields, laws, {}, defects)     # 規則層（0 次）
-        review = critic.adversarial_review(d, fields, client=client)   # 法官（1 次）
+        report = verify.verify_draft(d, fields, laws, timeline, defects)  # 規則層（0 次）
+        review = critic.adversarial_review(d, fields, client=client)      # 法官（1 次）
 
         if not critic.has_blocking_issue(review, report.get("issues", [])):
             break
         if rewrite_count >= max_rewrites:
             break
 
-        # 2) 帶規則問題 + 法官意見重寫（1 次）
+        # 2) 帶規則問題 + 法官意見重寫（1 次）；沿用 LLM 已定主文，維持主文理由一致
         feedback = critic.collect_feedback(review, report.get("issues", []))
         d = draft.generate_draft(analysis["route_key"], used, fields, laws, sims, defects,
                                  client=client, prev_draft=d, feedback=feedback)
         rewrite_count += 1
 
-    needs_human = critic.has_blocking_issue(review, report.get("issues", []))
+    # needs_human_review 只認「規則層紅燈」這類可程式判定的客觀錯誤（引用捏造、
+    # 漏回應主張、日期矛盾、條號寫壞）。法官的攻擊點屬「論理可更周延」的提升空間，
+    # 幾乎每件都挑得到，僅用來驅動重寫一次，不再計入人工複核，避免提示浮濫失去可信度。
+    needs_human = bool(report.get("issues"))
     return {
         "draft": d,
         "verification": report,
         "adversarial": review,
         "disposition": used,
-        "decided_by": "auto",
+        "decided_by": "llm",
         "rewrite_count": rewrite_count,
         "needs_human_review": needs_human,
         "quality_flags": _quality_flags(analysis, report, review, rewrite_count),
@@ -178,16 +287,18 @@ def process_case(payload: dict, client=None) -> dict:
 # ---------- 自動判定與品質旗標 ----------
 
 def _decide_disposition(sims: list[dict], defects: list[dict]) -> tuple[str, str]:
-    """自動判定主文，回傳 (主文, 判定理由)。
+    """產生「系統參考主文」，回傳 (參考主文, 參考理由)。
 
-    1. 健檢紅燈 → 原處分有重大瑕疵，撤銷另為適法處分
-    2. 相似案例主文多數決（歷史一致性）
-    3. 無資料 → 預設駁回
+    v2：主文改由 LLM 依事實與法律判斷（見 draft.generate_draft），本函式僅提供
+    給 LLM 的參考建議與 fallback，不再是最終結論：
+      1. 健檢紅燈 → 傾向撤銷
+      2. 相似案例主文多數 → 該主文
+      3. 無資料 → 傾向駁回（僅 fallback）
+    理由字串為對外顯示用，不含原始統計 dict 與 (n/總) 比數。
     """
     reds = [d for d in (defects or []) if str(d.get("level", "")).lower() == "red"]
     if reds:
-        titles = [d.get("title", d.get("id", "")) for d in reds]
-        return DISPOSITION_REVOKE, f"原處分健檢紅燈 {len(reds)} 項（{titles}），認有撤銷事由"
+        return DISPOSITION_REVOKE, f"原處分健檢發現 {len(reds)} 項重大瑕疵，傾向撤銷"
 
     counts: Counter[str] = Counter()
     for s in sims or []:
@@ -195,10 +306,10 @@ def _decide_disposition(sims: list[dict], defects: list[dict]) -> tuple[str, str
         if label:
             counts[label] += 1
     if counts:
-        top, n = counts.most_common(1)[0]
-        return top, f"相似案例主文多數決：{dict(counts)}，採 {top}（{n}/{sum(counts.values())}）"
+        top, _ = counts.most_common(1)[0]
+        return top, f"相似歷史案例多數為「{top}」"
 
-    return DISPOSITION_DISMISS, "無健檢紅燈且相似案例無主文資料，採預設主文"
+    return DISPOSITION_DISMISS, "無明顯瑕疵且無相似案例可參，暫採駁回為參考"
 
 
 def _case_disposition(sim: dict) -> str:
@@ -251,14 +362,25 @@ def _quality_flags(analysis: dict, report: dict, review: dict, rewrite_count: in
 # ---------- Demo / CLI ----------
 
 def _demo_payload() -> dict:
-    """符合交接契約的骨架測試輸入（洗錢案）。"""
+    """符合交接契約的示範輸入（洗錢案，資料為虛構示範用）。"""
     p = build_empty_input()
     p["case_id"] = "sim-114-001"
     p["case_type"] = {"label": "違反洗錢防制法事件", "route_key": "money_laundering",
                       "confidence": 0.92, "need_human_review": False}
-    p["extracted_fields"]["claims"] = [{"id": "C1", "summary": "原處分認定事實有誤", "quote": ""}]
-    p["raw_text"]["petition"] = "訴願人主張原處分認定事實有誤，請求撤銷。（骨架測試假資料）"
-    p["raw_text"]["original_disposition_doc"] = "原處分書：因違反洗錢防制法裁處。（骨架測試假資料）"
+    p["extracted_fields"]["original_disposition"] = {
+        "agency": "新北市政府警察局", "date": "民國114年3月1日",
+        "doc_no": "新北警刑字第1140012345號", "legal_basis": ["洗錢防制法第15條之2"],
+        "penalty_amount": 0, "service_date": "民國114年3月5日", "act_date": "民國113年12月10日",
+    }
+    p["extracted_fields"]["petition_filed_date"] = "民國114年3月20日"
+    p["extracted_fields"]["claims"] = [
+        {"id": "C1", "summary": "原處分認定訴願人交付帳戶之事實有誤", "quote": ""},
+        {"id": "C2", "summary": "訴願人並無違法之故意或過失", "quote": ""},
+    ]
+    p["raw_text"]["petition"] = (
+        "訴願人主張原處分認定其交付帳戶之事實有誤，且無違法故意過失，請求撤銷原處分。")
+    p["raw_text"]["original_disposition_doc"] = (
+        "新北市政府警察局以訴願人違反洗錢防制法第15條之2規定，交付金融帳戶予他人，為書面告誡處分。")
     return p
 
 

@@ -1,15 +1,16 @@
-"""單體審閱介面 v1.3（§14）。呼叫 core.pipeline，不含業務邏輯。
+"""單體審閱介面（§14）。呼叫 core.pipeline，不含業務邏輯。
 
-流程（v1.3：全自動，無人工確認步驟）：
-  貼入前段 JSON → 案件分析（路由 + KB 檢索 + 自動判定主文）→
-  草稿研擬（撰稿 → 規則檢查 → 法官審查 → 必要時自動重寫）→ 品質檢核報告。
+流程（v2.0：全自動二階段）：
+  上傳訴願書/原處分書 → 案件分析（擷取 + 路由 + KB 檢索 + 自動判定主文）→
+  決定書草稿（撰稿 → 規則檢查 → 法官審查 → 必要時自動重寫，全在系統內部）。
 
-介面：法制單位風格（深藍/金），步驟導引 + 頁面跳轉（Next/Back）。
+品質檢核在系統端執行，僅於有確定問題時提示人工複核。草稿可下載為 PDF。
+介面：法制單位風格（深藍/金），步驟導引 + 頁面跳轉。
 """
 
 from __future__ import annotations
 
-import json
+import io
 import sys
 from pathlib import Path
 
@@ -17,9 +18,26 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import streamlit as st  # noqa: E402
 
-from core.pipeline import analyze_case, generate_case_draft, _demo_payload  # noqa: E402
-from core.schemas import validate_input  # noqa: E402
+from core.pipeline import analyze_case, generate_case_draft, intake  # noqa: E402
 from core.bedrock_client import get_client  # noqa: E402
+from pipeline.kb_ingest_s3 import deidentify  # noqa: E402
+
+
+def _read_upload(uploaded) -> str:
+    """把上傳的檔案（PDF / txt）讀成純文字。"""
+    name = (uploaded.name or "").lower()
+    data = uploaded.read()
+    if name.endswith(".pdf"):
+        from pypdf import PdfReader
+        reader = PdfReader(io.BytesIO(data))
+        return "\n".join((p.extract_text() or "") for p in reader.pages)
+    # 純文字檔：容錯 UTF-8 / Big5
+    for enc in ("utf-8", "utf-8-sig", "big5", "cp950"):
+        try:
+            return data.decode(enc)
+        except UnicodeDecodeError:
+            continue
+    return data.decode("utf-8", errors="ignore")
 
 
 # ============ 頁面設定 ============
@@ -31,31 +49,58 @@ ROUTE_LABELS = {
     "noise": "噪音管制法", "general": "通用（其他案由）",
 }
 
-#: 檢核狀態 → 顯示文字
-STATUS_LABELS = {
-    ("pass", "green"): "✅ 通過",
-    ("skipped", "gray"): "⚪ 略過",
-    ("fail", "red"): "🔴 紅燈",
-    ("fail", "amber"): "🟡 黃燈",
-}
-
 # ============ 樣式（法制單位風格：深藍 #1a2a4a / 金 #b8860b）============
 st.markdown(
     """
     <style>
-      :root { --ink:#1a2a4a; --gold:#b8860b; --paper:#faf8f3; --line:#d8cfbe; }
-      .stApp { background: var(--paper); }
-      /* 頁首橫幅 */
-      .gov-header {
-        background: linear-gradient(135deg,#1a2a4a 0%,#26406e 100%);
-        color:#fff; padding:22px 28px; border-radius:10px;
-        border-bottom:4px solid var(--gold); margin-bottom:8px;
+      :root {
+        --ink:#1a2a4a; --ink2:#26406e; --gold:#b8860b;
+        --paper:#faf8f3; --panel:#ffffff; --line:#e0d8c6;
+        --muted:#5a6273;
       }
-      .gov-header h1 { color:#fff; font-size:1.55rem; margin:0; letter-spacing:2px; font-weight:700; }
-      .gov-header .sub { color:#d9e2f2; font-size:0.9rem; margin-top:6px; letter-spacing:1px; }
-      .gov-seal { font-size:2.2rem; margin-right:6px; }
-      /* 步驟列 */
-      .steps { display:flex; gap:10px; margin:18px 0 10px; }
+
+      /* ---- 全域底色與字色（強制淺色，避免深色主題撞色）---- */
+      .stApp { background:var(--paper); }
+      .stApp, .stApp p, .stApp li, .stApp span, .stApp label,
+      .stMarkdown, [data-testid="stMarkdownContainer"] { color:var(--ink); }
+      /* 主內容區標題深藍；用 :not(.gov-header ...) 避免蓋掉深底橫幅的白字 */
+      .block-container h1, .block-container h2, .block-container h3,
+      .block-container h4, .block-container h5, .block-container h6 {
+        color:var(--ink); font-weight:700;
+      }
+
+      /* 主內容區留白 */
+      .block-container { padding-top:2.5rem; max-width:1080px; }
+
+      /* 隱藏 Streamlit 頂端工具列（Deploy 按鈕、漢堡選單）與 footer —— 使用者用不到 */
+      header[data-testid="stHeader"] { background:transparent; }
+      [data-testid="stToolbar"] { display:none !important; }
+      #MainMenu { display:none !important; }
+      footer { display:none !important; }
+      [data-testid="stDecoration"] { display:none !important; }
+
+      /* ---- 側邊欄 ---- */
+      [data-testid="stSidebar"] { background:#f2ece0; border-right:1px solid var(--line); }
+      [data-testid="stSidebar"] * { color:var(--ink) !important; }
+
+      /* ---- 說明文字（caption）---- */
+      .stCaption, [data-testid="stCaptionContainer"],
+      [data-testid="stCaptionContainer"] * { color:var(--muted) !important; }
+
+      /* ---- 頁首橫幅 ---- */
+      .gov-header {
+        background:linear-gradient(135deg,var(--ink) 0%,var(--ink2) 100%);
+        padding:22px 28px; border-radius:12px;
+        border-bottom:4px solid var(--gold); margin-bottom:10px;
+      }
+      .gov-header h1, .block-container .gov-header h1 {
+        color:#ffffff !important; font-size:1.5rem; margin:0; letter-spacing:2px;
+      }
+      .gov-header .sub { color:#e6ecf7 !important; font-size:0.88rem; margin-top:6px; letter-spacing:1px; }
+      .gov-seal { font-size:2rem; margin-right:8px; }
+
+      /* ---- 步驟列 ---- */
+      .steps { display:flex; gap:10px; margin:16px 0 14px; }
       .step {
         flex:1; text-align:center; padding:12px 6px; border-radius:8px;
         background:#efe9db; color:#8a8172; font-size:0.92rem; border:1px solid var(--line);
@@ -64,28 +109,87 @@ st.markdown(
       .step.done { background:#e8efe4; color:#3c6e47; border-color:#bcd4bf; }
       .step .num { display:inline-block; width:22px; height:22px; line-height:22px; border-radius:50%;
         background:rgba(255,255,255,.25); margin-right:6px; font-size:0.8rem; }
-      .step.active .num { background:var(--gold); }
-      /* 卡片 */
+      .step.active .num { background:var(--gold); color:var(--ink); }
+
+      /* ---- 卡片 ---- */
       .law-card {
-        background:#fff; border:1px solid var(--line); border-left:4px solid var(--gold);
+        background:var(--panel); border:1px solid var(--line); border-left:4px solid var(--gold);
         border-radius:8px; padding:16px 20px; margin:10px 0;
       }
+      .law-card, .law-card p, .law-card h3, .law-card span { color:var(--ink); }
       .badge {
-        display:inline-block; background:var(--ink); color:#fff; padding:3px 12px;
+        display:inline-block; background:var(--ink); color:#fff !important; padding:3px 12px;
         border-radius:14px; font-size:0.82rem; letter-spacing:1px;
       }
-      .badge.gold { background:var(--gold); }
-      /* 決定書預覽（公文感）*/
-      .doc-preview {
-        background:#fff; border:1px solid var(--line); border-radius:6px; padding:28px 34px;
-        font-family:"KaiTi","DFKai-SB","BiauKai",serif; line-height:2.0; color:#1a1a1a;
-        box-shadow:0 2px 8px rgba(26,42,74,.06);
+      .badge.gold { background:var(--gold); color:#fff !important; }
+
+      /* ---- 檔案上傳元件（改為淺底，修正深底看不到字）---- */
+      [data-testid="stFileUploader"] label,
+      [data-testid="stFileUploaderDropzone"] * { color:var(--ink) !important; }
+      [data-testid="stFileUploaderDropzone"] {
+        background:#fbf9f4 !important; border:1.5px dashed var(--gold) !important;
+        border-radius:10px;
       }
+      /* 已上傳檔案列 */
+      [data-testid="stFileUploaderFile"] { color:var(--ink) !important; }
+      [data-testid="stFileUploaderFile"] * { color:var(--ink) !important; }
+
+      /* 上傳的「Browse files」按鈕：金色底白字，明顯可見 */
+      [data-testid="stFileUploaderDropzone"] button {
+        background:var(--gold) !important; color:#fff !important; border:none !important;
+        border-radius:6px !important; font-weight:600 !important; opacity:1 !important;
+      }
+      [data-testid="stFileUploaderDropzone"] button * { color:#fff !important; }
+      /* dropzone 說明文字（200MB per file...）用可讀的中灰 */
+      [data-testid="stFileUploaderDropzoneInstructions"],
+      [data-testid="stFileUploaderDropzoneInstructions"] * { color:var(--muted) !important; }
+
+      /* ---- 主要按鈕 ---- */
+      .stButton>button, .stDownloadButton>button {
+        border-radius:8px; font-weight:600;
+      }
+      .stButton>button[kind="primary"], .stDownloadButton>button[kind="primary"] {
+        background:var(--gold); color:#fff; border:none;
+      }
+      .stButton>button[kind="primary"]:hover, .stDownloadButton>button[kind="primary"]:hover {
+        background:#9c7209; color:#fff;
+      }
+      .stButton>button[kind="secondary"] {
+        background:#fff; color:var(--ink); border:1px solid var(--line);
+      }
+
+      /* ---- expander ---- */
+      [data-testid="stExpander"] {
+        background:var(--panel); border:1px solid var(--line); border-radius:8px;
+      }
+      [data-testid="stExpander"] summary, [data-testid="stExpander"] summary * { color:var(--ink) !important; }
+
+      /* ---- 提示框（info/warning/error）文字對比 ---- */
+      [data-testid="stAlert"] * { color:var(--ink) !important; }
+
+      /* ---- 決定書預覽（公文感）---- */
+      .doc-preview {
+        background:var(--panel); border:1px solid var(--line); border-radius:8px; padding:28px 34px;
+        font-family:"KaiTi","DFKai-SB","BiauKai","STKaiti",serif; line-height:2.0; color:#1a1a1a;
+        box-shadow:0 2px 10px rgba(26,42,74,.07); margin-top:8px;
+      }
+      .doc-preview, .doc-preview p, .doc-preview b { color:#1a1a1a; }
       .doc-preview .main-text { font-size:1.15rem; font-weight:700; text-align:center;
-        letter-spacing:3px; margin:10px 0 22px; }
+        letter-spacing:3px; margin:10px 0 22px; color:var(--ink); }
       .doc-preview .reason-no { color:var(--gold); font-weight:700; }
-      h2, h3 { color:var(--ink); }
-      .stButton>button { border-radius:6px; }
+
+      /* ---- 系統判斷結果橫幅（草稿上方）---- */
+      .verdict-banner {
+        display:flex; align-items:center; gap:16px;
+        background:linear-gradient(135deg,var(--ink) 0%,var(--ink2) 100%);
+        border-left:6px solid var(--gold); border-radius:10px;
+        padding:16px 24px; margin:6px 0 14px;
+      }
+      .verdict-label {
+        color:#e6ecf7 !important; font-size:0.85rem; letter-spacing:2px;
+        border-right:1px solid rgba(255,255,255,.3); padding-right:16px;
+      }
+      .verdict-value { color:#ffffff !important; font-size:1.3rem; font-weight:700; letter-spacing:2px; }
     </style>
     """,
     unsafe_allow_html=True,
@@ -101,12 +205,41 @@ def goto(step: int):
     st.session_state["step"] = step
 
 
-STEP_NAMES = ["案件受理與分析", "草稿研擬與自動審查", "品質檢核報告"]
+STEP_NAMES = ["案件受理與分析", "決定書草稿"]
 
 
 def _cn_num(n: int) -> str:
     cn = "一二三四五六七八九十"
     return cn[n - 1] if 1 <= n <= 10 else str(n)
+
+
+def _draft_to_pdf(draft: dict) -> bytes:
+    """把決定書草稿組成 PDF（含中文），回傳 bytes 供下載。"""
+    import pymupdf
+
+    lines = ["訴 願 決 定 書（草稿）", "", f"主文：{draft.get('main', '')}", "", "事實及理由"]
+    for i, p in enumerate(draft.get("reasons", []), start=1):
+        lines.append(f"{_cn_num(i)}、{p.get('text', '')}")
+    remedy = draft.get("remedy_notice")
+    if remedy:
+        lines += ["", "教示", remedy]
+
+    doc = pymupdf.open()
+    page_w, page_h, margin, size, line_h, max_chars = 595, 842, 60, 13, 22, 34
+    page = doc.new_page(width=page_w, height=page_h)
+    y = margin
+    for raw in lines:
+        chunks = [raw[i:i + max_chars] for i in range(0, len(raw), max_chars)] or [""]
+        for chunk in chunks:
+            if y > page_h - margin:
+                page = doc.new_page(width=page_w, height=page_h)
+                y = margin
+            page.insert_text((margin, y), chunk, fontname="china-t", fontsize=size)
+            y += line_h
+    doc.subset_fonts()
+    out = doc.tobytes(garbage=4, deflate=True)
+    doc.close()
+    return out
 
 
 def _render_doc(draft: dict):
@@ -116,12 +249,20 @@ def _render_doc(draft: dict):
         reasons_html += f'<p><span class="reason-no">{_cn_num(i)}、</span>{p.get("text","")}</p>'
     if not reasons_html:
         reasons_html = "<p>（尚無理由段落）</p>"
+    remedy = draft.get("remedy_notice")
+    remedy_html = ""
+    if remedy:
+        remedy_html = (
+            f'<div style="border-top:1px dashed #cfc6b4;margin-top:12px;padding-top:12px;">'
+            f'<b>教示</b><p>{remedy}</p></div>'
+        )
     st.markdown(
         f'<div class="doc-preview">'
         f'<div style="text-align:center;letter-spacing:6px;font-size:1.05rem;">訴 願 決 定 書（草稿）</div>'
         f'<div class="main-text">主文：{draft.get("main","")}</div>'
         f'<div style="border-top:1px dashed #cfc6b4;padding-top:12px;">'
         f'<b>事實及理由</b>{reasons_html}</div>'
+        f'{remedy_html}'
         f'</div>', unsafe_allow_html=True,
     )
 
@@ -137,26 +278,23 @@ def render_steps(current: int):
 # ============ 頁首 ============
 st.markdown(
     """
-    <div class="gov-header">
-      <h1><span class="gov-seal">⚖️</span>新北市政府訴願審議 AI 輔助工作台</h1>
-      <div class="sub">法制局 · 訴願案件審理輔助系統　|　先審查、後撰稿　每句法律依據可追溯</div>
+    <div class="gov-header" style="color:#ffffff">
+      <div style="color:#ffffff;font-size:1.5rem;font-weight:700;letter-spacing:2px">
+        <span style="font-size:2rem;margin-right:8px">⚖️</span>新北市政府訴願審議 AI 輔助工作台
+      </div>
+      <div style="color:#e6ecf7;font-size:0.88rem;margin-top:6px;letter-spacing:1px">
+        法制局 · 訴願案件審理輔助系統　|　先審查、後撰稿　每句法律依據可追溯
+      </div>
     </div>
     """,
     unsafe_allow_html=True,
 )
 
 with st.sidebar:
-    st.markdown("### ⚙️ 系統設定")
-    dry_run = st.toggle("Dry-run 模式（不呼叫 Bedrock/KB）", value=True,
-                        help="開啟時用假資料驗證流程；關閉才呼叫真實模型")
-    st.markdown("---")
     st.markdown("#### 📋 審理進度")
     for i, name in enumerate(STEP_NAMES, start=1):
         mark = "✅" if i < st.session_state["step"] else ("🔵" if i == st.session_state["step"] else "⚪")
         st.markdown(f"{mark} 第 {i} 階段　{name}")
-    st.markdown("---")
-    st.caption("競賽規範：Amazon Bedrock ≤ 1 RPS，由 bedrock_client 全域限流保證。")
-    st.caption("單件呼叫：檢索 1 + 撰稿 1 + 法官 1 = 3 次；觸發重寫最壞 5 次；不受理案 0 次。")
 
 render_steps(st.session_state["step"])
 
@@ -164,26 +302,51 @@ render_steps(st.session_state["step"])
 # ============ 第 1 階段：案件受理與分析 ============
 if st.session_state["step"] == 1:
     st.markdown("### 　一、案件受理與分析")
-    st.caption("接收前段交接之案件 JSON，進行案由路由、法規／案例檢索（RAG）並自動判定主文。")
+    st.caption("上傳訴願書與原處分書，系統自動擷取欄位、判定案由，並檢索相關法規與歷史案例。")
 
-    default_json = json.dumps(_demo_payload(), ensure_ascii=False, indent=2)
-    raw = st.text_area("案件交接資料（JSON，schema v1.0）", value=default_json, height=240)
+    up_petition = st.file_uploader("訴願書（PDF 或 純文字檔）　必填", type=["pdf", "txt"],
+                                   key="up_petition")
+
+    up_disposition = st.file_uploader("原處分書（PDF 或 純文字檔）　建議上傳", type=["pdf", "txt"],
+                                      key="up_disposition")
+    st.caption("　　原處分書提供處分機關、法令依據、送達日期等資訊；未提供時無法核算訴願期間與原處分瑕疵。")
+
+    up_reply = st.file_uploader("機關答辯書（PDF 或 純文字檔）　可選", type=["pdf", "txt"],
+                                key="up_reply")
+    st.caption("　　機關答辯書常於審理中始送達，未提供不影響流程。")
+
+    with st.expander("或改用貼上文字（沒有檔案時）"):
+        pasted_petition = st.text_area("訴願書全文", height=160, key="paste_petition")
 
     if st.button("⚖️ 受理並執行分析", type="primary", use_container_width=True):
-        try:
-            payload = json.loads(raw)
-        except json.JSONDecodeError as e:
-            st.error(f"JSON 解析失敗：{e}")
-            payload = None
-        if payload is not None:
-            problems = validate_input(payload)
-            if problems:
-                st.error("交接資料不符契約：" + "；".join(problems))
-            else:
-                with st.spinner("正在路由分類並檢索相關法規與案例…"):
-                    st.session_state["analysis"] = analyze_case(payload, client=get_client(dry_run=dry_run))
-                st.session_state.pop("draft_result", None)
-                st.rerun()
+        # 1) 取文字：優先用上傳檔，否則用貼上的文字
+        petition_txt = _read_upload(up_petition) if up_petition else (pasted_petition or "")
+        disposition_txt = _read_upload(up_disposition) if up_disposition else ""
+        reply_txt = _read_upload(up_reply) if up_reply else ""
+
+        if not petition_txt.strip():
+            st.error("請至少提供訴願書（上傳檔案或貼上文字）。")
+        else:
+            with st.spinner("去識別化 → 擷取欄位 → 案由分類 → 檢索法規與案例…"):
+                # 2) 去識別化（競賽規範：個資不得送進 AWS；文字會經 Bedrock 擷取）
+                petition_txt, _ = deidentify(petition_txt)
+                if disposition_txt:
+                    disposition_txt, _ = deidentify(disposition_txt)
+                if reply_txt:
+                    reply_txt, _ = deidentify(reply_txt)
+
+                # 3) 原始文字 → 交接 JSON（intake：分類 0 呼叫 + 擷取 1 呼叫）
+                case_text = {
+                    "petition": petition_txt,
+                    "original_disposition_doc": disposition_txt,
+                    "agency_reply_doc": reply_txt,
+                }
+                payload = intake(case_text, client=get_client())
+
+                # 4) 分析（路由 + KB 檢索 + 自動判定主文）
+                st.session_state["analysis"] = analyze_case(payload, client=get_client())
+            st.session_state.pop("draft_result", None)
+            st.rerun()
 
     if "analysis" in st.session_state:
         a = st.session_state["analysis"]
@@ -191,28 +354,48 @@ if st.session_state["step"] == 1:
             st.error(f"{a['error']}：{a.get('problems')}")
             st.stop()
 
-        c1, c2, c3 = st.columns(3)
+        # 不受理案主文於程序階段即確定（快速通道，不進撰稿）；其餘案件的主文
+        # 由第二階段撰稿時 LLM 依事實與法律判斷，此處僅顯示初步參考方向。
+        if a.get("inadmissible"):
+            mid_title, mid_value = "程序判定", a.get("decided_disposition", "")
+        else:
+            mid_title, mid_value = "初步參考方向", f"{a.get('decision_basis','')}"
+
+        c1, c2 = st.columns(2)
         c1.markdown(f'<div class="law-card"><div class="badge gold">案由分類</div>'
                     f'<h3 style="margin:8px 0 0">{ROUTE_LABELS.get(a["route_key"], a["route_key"])}</h3></div>',
                     unsafe_allow_html=True)
-        c2.markdown(f'<div class="law-card"><div class="badge">系統判定主文</div>'
-                    f'<p style="margin:8px 0 0">{a.get("decided_disposition","")}</p></div>',
+        c2.markdown(f'<div class="law-card"><div class="badge">{mid_title}</div>'
+                    f'<p style="margin:8px 0 0">{mid_value}</p></div>',
                     unsafe_allow_html=True)
-        hr = "需人工複核" if a.get("need_human_review") else "信心足夠"
-        c3.markdown(f'<div class="law-card"><div class="badge">分類信心</div>'
-                    f'<h3 style="margin:8px 0 0">{hr}</h3></div>', unsafe_allow_html=True)
 
-        st.caption(f"　判定依據：{a.get('decision_basis','')}")
-        if a.get("inadmissible"):
-            st.warning(f"本案程序不受理（{a.get('inadmissible_note','')}），"
-                       "將走快速通道套用款次模板，不呼叫 Bedrock。")
+        if not a.get("inadmissible"):
+            st.caption("　主文將於下一階段由系統依事實與法律判斷後產生。")
+        else:
+            st.warning(f"本案程序不受理（{a.get('inadmissible_note','')}），將套用不受理款次模板。")
 
         with st.expander("📚 檢索到的推薦法規", expanded=True):
-            for law in a.get("recommended_laws", []) or [{"text": "（尚未接 KB，暫無資料）"}]:
-                st.markdown(f"- {law.get('text','')}")
-        with st.expander("📂 相似歷史案例"):
-            for s in a.get("similar_cases", []) or [{"text": "（尚未接 KB，暫無資料）"}]:
-                st.markdown(f"- {s.get('text','')}")
+            laws = a.get("recommended_laws", [])
+            if laws:
+                for law in laws:
+                    cite = law.get("citation", "") or law.get("law", "")
+                    reason = law.get("reason", "")
+                    st.markdown(f"- **{cite}**　{reason}" if reason else f"- **{cite}**")
+            else:
+                st.markdown("- （本案無相關法規檢索結果）")
+        st.markdown("#### 📂 相似歷史案例")
+        sims = a.get("similar_cases", [])
+        if sims:
+            # 每筆一個可展開項：標題顯示案號＋主文，點開看全文（避免頁面過長）
+            for s in sims:
+                doc = s.get("doc_id", "") or "（案號未標）"
+                disp = s.get("disposition", "")
+                full = s.get("full_text") or s.get("reasoning_summary", "")
+                label = f"{doc}　（{disp}）" if disp else doc
+                with st.expander(label):
+                    st.markdown(full or "（無內文）")
+        else:
+            st.caption("（本案無相似歷史案例）")
 
         st.markdown("---")
         _, nav = st.columns([3, 1])
@@ -220,101 +403,62 @@ if st.session_state["step"] == 1:
                    on_click=goto, args=(2,))
 
 
-# ============ 第 2 階段：草稿研擬與自動審查 ============
+# ============ 第 2 階段：決定書草稿 ============
 elif st.session_state["step"] == 2:
-    st.markdown("### 　二、草稿研擬與自動審查")
-    st.caption("依判定主文與檢索結果生成理由欄；規則檢查與法官審查發現重大問題時，系統自動重寫一次。")
+    st.markdown("### 　二、決定書草稿")
+    st.caption("系統依事實、可引用法條與檢索結果判斷主文並撰寫理由，可下載為 PDF。")
 
     if "analysis" not in st.session_state:
         st.warning("請先完成第一階段分析。")
         st.button("◀ 返回第一階段", on_click=goto, args=(1,))
     else:
         a = st.session_state["analysis"]
-        st.info(f"　系統判定主文：**{a.get('decided_disposition','')}**")
 
         if st.button("✍️ 生成決定書草稿", type="primary", use_container_width=True):
-            with st.spinner("研擬理由欄 → 規則檢查 → 法官審查 →（必要時）自動重寫…"):
-                st.session_state["draft_result"] = generate_case_draft(a, client=get_client(dry_run=dry_run))
+            with st.spinner("研擬決定書草稿中…"):
+                st.session_state["draft_result"] = generate_case_draft(a, client=get_client())
             st.rerun()
 
         if "draft_result" in st.session_state:
             r = st.session_state["draft_result"]
-            n = r.get("rewrite_count", 0)
-            if n:
-                st.warning(f"審查發現問題，已自動重寫 {n} 次以修正。")
-            else:
-                st.success("草稿一次通過規則檢查與法官審查，未觸發重寫。")
+
+            # 在草稿上方顯著顯示系統判斷結果（主文）
+            disp = r.get("disposition") or r["draft"].get("main", "")
+            st.markdown(
+                f'<div class="verdict-banner">'
+                f'<span class="verdict-label">系統判斷結果</span>'
+                f'<span class="verdict-value">{disp}</span>'
+                f'</div>', unsafe_allow_html=True)
+
+            # 只有系統確定抓到問題（規則層紅燈，重寫後仍未解）才提示人工複核；
+            # 並把「為什麼」有理有據列出來（檢查事項 + 說明 + 證據），而非籠統一句話。
+            # 其餘一律視為通過，品質檢核在系統內部進行，不對使用者展示明細。
+            if r.get("needs_human_review"):
+                red_checks = [c for c in r.get("verification", {}).get("checks", [])
+                              if c.get("status") == "fail" and c.get("level") == "red"]
+                st.error("⚠️ 本件經系統檢核發現下列問題，建議人工複核後再行核發：")
+                for c in red_checks:
+                    ev = "；".join(str(e) for e in c.get("evidence", []))
+                    body = (f'<div class="law-card" style="border-left-color:#c0392b">'
+                            f'<div class="badge" style="background:#c0392b">{c.get("name","")}</div>'
+                            f'<p style="margin:8px 0 4px">{c.get("detail","")}</p>'
+                            + (f'<p style="margin:0;color:#666;font-size:0.9rem">證據：{ev}</p>' if ev else "")
+                            + '</div>')
+                    st.markdown(body, unsafe_allow_html=True)
+
             _render_doc(r["draft"])
+
+            case_id = a.get("case_id") or "訴願決定書草稿"
+            st.download_button(
+                "⬇️ 下載草稿（PDF）",
+                data=_draft_to_pdf(r["draft"]),
+                file_name=f"{case_id}_訴願決定書草稿.pdf",
+                mime="application/pdf",
+                type="primary",
+                use_container_width=True,
+            )
 
         st.markdown("---")
         b1, _, b2 = st.columns([1, 2, 1])
         b1.button("◀ 上一步", use_container_width=True, on_click=goto, args=(1,))
-        if "draft_result" in st.session_state:
-            b2.button("下一步：品質檢核 ▶", type="primary", use_container_width=True,
-                      on_click=goto, args=(3,))
-
-
-# ============ 第 3 階段：品質檢核報告 ============
-elif st.session_state["step"] == 3:
-    st.markdown("### 　三、品質檢核報告")
-    st.caption("規則驗證（V1–V10，純程式）與法官對抗式審查結果。紅燈項供承辦人事後複核，不阻斷產出。")
-
-    if "draft_result" not in st.session_state:
-        st.warning("請先完成第二階段草稿研擬。")
-        st.button("◀ 返回第二階段", on_click=goto, args=(2,))
-    else:
-        r = st.session_state["draft_result"]
-        v = r.get("verification", {})
-        adv = r.get("adversarial", {})
-        summary = v.get("summary", {})
-
-        if r.get("needs_human_review"):
-            st.error("⚠️ 重寫後仍有未解決之問題，本件建議人工複核後再核發。")
-        else:
-            st.success("✅ 規則驗證與法官審查均已通過。")
-
-        m1, m2, m3, m4 = st.columns(4)
-        m1.metric("通過", summary.get("pass", 0))
-        m2.metric("紅燈", summary.get("red", 0))
-        m3.metric("黃燈", summary.get("amber", 0))
-        m4.metric("自動重寫", r.get("rewrite_count", 0))
-
-        flags = r.get("quality_flags") or []
-        if flags:
-            st.markdown('<div class="law-card"><div class="badge gold">注意訊號</div>'
-                        + "".join(f"<p style='margin:6px 0 0'>· {f}</p>" for f in flags)
-                        + "</div>", unsafe_allow_html=True)
-
-        st.markdown("#### 　規則驗證明細（0 次 Bedrock 呼叫）")
-        rows = [{
-            "項次": c["id"],
-            "檢核項": c["name"],
-            "狀態": STATUS_LABELS.get((c["status"], c["display_level"]), c["status"]),
-            "說明": c["detail"],
-            "證據": "; ".join(str(e) for e in c.get("evidence", [])) or "—",
-        } for c in v.get("checks", [])]
-        if rows:
-            st.dataframe(rows, use_container_width=True, hide_index=True)
-
-        st.markdown("#### 　法官對抗式審查")
-        st.markdown(f"- 是否通過：{'通過' if adv.get('passed', True) else '未通過'}　|　"
-                    f"撤銷風險：**{adv.get('revocation_risk', '—')}**")
-        attacks = adv.get("attacks") or []
-        if not attacks:
-            st.caption(adv.get("note", "（無挑戰點：dry-run、骨架階段或不受理案件）"))
-        for att in attacks:
-            st.markdown(f'<div class="law-card"><div class="badge">{att.get("severity","")}</div>'
-                        f'<p style="margin:8px 0 4px">{att.get("point","")}</p>'
-                        f'<p style="margin:0;color:#666;font-size:0.9rem">修正方向：{att.get("fix","—")}</p>'
-                        f'</div>', unsafe_allow_html=True)
-
-        st.markdown("#### 　決定書草稿")
-        _render_doc(r["draft"])
-
-        with st.expander("🧾 完整輸出 JSON（供除錯與稽核）"):
-            st.json(r)
-
-        st.markdown("---")
-        b1, _, b2 = st.columns([1, 2, 1])
-        b1.button("◀ 上一步", use_container_width=True, on_click=goto, args=(2,))
         b2.button("🔄 審理新案件", use_container_width=True, on_click=goto, args=(1,))

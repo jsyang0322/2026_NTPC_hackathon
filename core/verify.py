@@ -209,25 +209,29 @@ def _check_inline_citations_declared(paragraphs: list[dict]) -> dict:
 
 
 def _check_article_number_format(paragraphs: list[dict]) -> dict:
-    """V3 條號書寫正確（含「之2」）。補路線 A 語意檢索之不足（§4.5）。"""
-    bad_format: list[str] = []
-    malformed_text: list[str] = []
+    """V3 條號書寫正確（含「之2」）。補路線 A 語意檢索之不足（§4.5）。
 
-    for c in _raw_cites(paragraphs):
-        if _normalize_citation(c) is None:
-            bad_format.append(c)
+    只有「內文把條號寫殘」（如「第條」「第15條之」缺數字）才是客觀錯誤 → 紅燈。
+    cites 欄位裡有無法解析為標準條號者，多半是夾帶了判決字號/來源標記（如
+    「臺北高等行政法院…判決-洗錢防制法第22條」），並非草稿寫壞條號，
+    降為黃燈提醒即可，不觸發人工複核，避免假紅燈稀釋可信度。
+    """
+    malformed_text: list[str] = []
     for p in paragraphs:
         malformed_text.extend(find_malformed(p.get("text", "")))
 
-    problems = bad_format + malformed_text
-    if problems:
-        detail_parts = []
-        if bad_format:
-            detail_parts.append(f"cites 有 {len(bad_format)} 項無法解析為合法條號")
-        if malformed_text:
-            detail_parts.append(f"內文有 {len(malformed_text)} 處條號寫法不完整（如「條之」缺數字）")
+    # 內文條號寫殘 → 紅燈（真正的客觀錯誤）
+    if malformed_text:
         return _result("V3", "條號書寫格式正確（含之N）", "fail", "red",
-                       "；".join(detail_parts) + "。", evidence=problems)
+                       f"內文有 {len(malformed_text)} 處條號寫法不完整（如「條之」缺數字）。",
+                       evidence=malformed_text)
+
+    # cites 有非標準條號（多為夾帶判決字號）→ 黃燈提醒，不擋
+    bad_format = [c for c in _raw_cites(paragraphs) if _normalize_citation(c) is None]
+    if bad_format:
+        return _result("V3", "條號書寫格式正確（含之N）", "fail", "amber",
+                       f"cites 有 {len(bad_format)} 項非標準條號格式（多為夾帶判決字號或來源標記），"
+                       "追溯性不受影響，建議留意。", evidence=bad_format)
 
     if not _raw_cites(paragraphs):
         return _result("V3", "條號書寫格式正確（含之N）", "skipped", "red",

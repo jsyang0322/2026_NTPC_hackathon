@@ -145,6 +145,71 @@ def _write_stamp(ts: float) -> None:
         pass
 
 
+# ===========================================================================
+# InvokeModel body 組裝與回應解析
+# ===========================================================================
+# 競賽帳號的允許清單只授權 bedrock:InvokeModel，未授權 bedrock:Converse。
+# 故所有文字生成走 InvokeModel。不同模型家族的 body / 回應形狀不同：
+#   - Anthropic Claude：Messages API（anthropic_version + messages + system 頂層）
+#   - Amazon Nova：messages + inferenceConfig，回應在 output.message.content
+# 以 model_id 內的關鍵字分派，與 henry/rag_triage.py 的 nova() 對齊。
+
+def _to_text_content(content: Any) -> str:
+    """把 Converse 風格的 content（[{"text": ...}] 或字串）攤平成純文字。"""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for block in content:
+            if isinstance(block, dict) and "text" in block:
+                parts.append(block["text"])
+            elif isinstance(block, str):
+                parts.append(block)
+        return "\n".join(parts)
+    return str(content)
+
+
+def _build_invoke_body(model_id: str, messages: list[dict], system: str | None,
+                       temperature: float, max_tokens: int) -> dict:
+    """把 Converse 風格的 messages 轉成 InvokeModel 的 body。"""
+    if "anthropic" in model_id:
+        body: dict[str, Any] = {
+            "anthropic_version": "bedrock-2023-05-31",
+            "max_tokens": max_tokens,
+            "temperature": temperature,
+            "messages": [
+                {"role": m.get("role", "user"),
+                 "content": _to_text_content(m.get("content", ""))}
+                for m in messages
+            ],
+        }
+        if system:
+            body["system"] = system
+        return body
+
+    # Amazon Nova / 其他採 Converse-on-invoke 形狀的模型
+    body = {
+        "messages": [
+            {"role": m.get("role", "user"),
+             "content": [{"text": _to_text_content(m.get("content", ""))}]}
+            for m in messages
+        ],
+        "inferenceConfig": {"temperature": temperature, "maxTokens": max_tokens},
+    }
+    if system:
+        body["system"] = [{"text": system}]
+    return body
+
+
+def _extract_invoke_text(model_id: str, payload: dict) -> str:
+    """從 InvokeModel 回應取出純文字。"""
+    if "anthropic" in model_id:
+        blocks = payload.get("content", [])
+        return "".join(b.get("text", "") for b in blocks if isinstance(b, dict))
+    # Amazon Nova
+    return payload["output"]["message"]["content"][0]["text"]
+
+
 @dataclass
 class BedrockClient:
     """全域 ≤ 1 RPS 的 Bedrock 呼叫入口。
@@ -153,7 +218,7 @@ class BedrockClient:
         min_interval: 兩次呼叫之間的最小間隔秒數（1.05 留安全邊際）。
         cache_dir:    依 prompt hash 落檔的快取目錄。
         max_retries:  ThrottlingException 的指數退避重試次數。
-        dry_run:      True 時不呼叫真實 Bedrock，回傳 mock，用於骨架驗證與離線測試。
+        dry_run:      True 時不呼叫真實 Bedrock，回傳 mock，用於離線開發與測試。
     """
 
     min_interval: float = MIN_INTERVAL
@@ -200,7 +265,7 @@ class BedrockClient:
             json.dumps(value, ensure_ascii=False, indent=2), encoding="utf-8"
         )
 
-    # --- 對外：文字生成（Converse API）---
+    # --- 對外：文字生成（InvokeModel）---
     def converse(
         self,
         messages: list[dict],
@@ -210,7 +275,13 @@ class BedrockClient:
         max_tokens: int = 4096,
         use_cache: bool = True,
     ) -> str:
-        """呼叫 Bedrock Converse，回傳純文字。受全域限流與快取保護。"""
+        """呼叫 Bedrock 產生文字，回傳純文字。受全域限流與快取保護。
+
+        對外沿用 Converse 風格的 messages 介面
+        （[{"role","content":[{"text":...}]}]），呼叫端不需改動。
+        內部改走 InvokeModel：競賽帳號的允許清單只授權
+        bedrock:InvokeModel，未授權 bedrock:Converse，Converse 會被 IAM 擋下。
+        """
         model_id = model_id or MODEL_WRITER
         payload = {
             "model_id": model_id,
@@ -227,33 +298,28 @@ class BedrockClient:
                 return cached["text"]
 
         if self.dry_run:
-            text = f"[DRY_RUN::{model_id}] 這是骨架驗證用的假回應，不呼叫真實 Bedrock。"
+            text = f"[DRY_RUN::{model_id}] 離線模式回應，未呼叫真實 Bedrock。"
             if use_cache:
                 self._cache_put(key, {"text": text, "dry_run": True})
             return text
 
-        kwargs: dict[str, Any] = {
-            "modelId": model_id,
-            "messages": messages,
-            "inferenceConfig": {"temperature": temperature, "maxTokens": max_tokens},
-        }
-        if system:
-            kwargs["system"] = [{"text": system}]
-
-        text = self._invoke_with_retry(kwargs)
+        body = _build_invoke_body(model_id, messages, system, temperature, max_tokens)
+        text = self._invoke_with_retry(model_id, body)
         if use_cache:
             self._cache_put(key, {"text": text})
         return text
 
-    def _invoke_with_retry(self, kwargs: dict) -> str:
+    def _invoke_with_retry(self, model_id: str, body: dict) -> str:
         from botocore.exceptions import ClientError
 
+        blob = json.dumps(body, ensure_ascii=False)
         delay = 1.0
         for attempt in range(self.max_retries):
             self._throttle()
             try:
-                resp = self._bedrock().converse(**kwargs)
-                return resp["output"]["message"]["content"][0]["text"]
+                resp = self._bedrock().invoke_model(modelId=model_id, body=blob)
+                payload = json.loads(resp["body"].read())
+                return _extract_invoke_text(model_id, payload)
             except ClientError as e:
                 code = e.response.get("Error", {}).get("Code", "")
                 if code in ("ThrottlingException", "TooManyRequestsException") and attempt < self.max_retries - 1:

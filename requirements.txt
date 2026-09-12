@@ -7,6 +7,9 @@ pypdf>=5.0.0             # Henry pipeline 的 PDF 文字擷取
 scikit-learn>=1.4.0      # 案由分類（§5.3）；henry/make_and_upload.py 亦用其資料集
 numpy>=1.26.0            # 向量運算（henry/rag_triage.py 的相似度計算）
 
+# === 設定載入 ===
+python-dotenv>=1.0.0     # 啟動時自動載入 .env（KB id、模型 id 等），免每個 shell 手動 source
+
 # === 介面 ===
 streamlit>=1.34.0        # 審閱介面（§14，單體 Demo）
 

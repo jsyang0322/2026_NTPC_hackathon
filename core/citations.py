@@ -133,6 +133,18 @@ def clean_law_name(raw: str) -> str:
     if matched:
         return max(matched, key=len)
 
+    # 容錯：PDF 抽取常掉首字（「廢棄物清理法」→「棄物清理法」）。若 law endswith
+    # 某已登錄法規去掉首字的尾綴（尾綴須 >=4 字避免短名誤配），補回完整法名。
+    for k in KNOWN_LAWS:
+        if len(k) >= 5 and law.endswith(k[1:]):
+            return k
+
+    # 指稱性法名（同法/本法等）常被前導連接詞黏成「惟同法」「按本法」，
+    # endswith 指稱名即視為指稱性，回傳該指稱名讓 _to_parts 過濾掉（引用須寫全名）。
+    ref = [k for k in IGNORABLE_LAW_NAMES if law.endswith(k)]
+    if ref:
+        return max(ref, key=len)
+
     return _strip_leading_noise(law)
 
 
