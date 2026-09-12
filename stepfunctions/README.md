@@ -16,7 +16,6 @@ Lambda: start → 啟動 Step Functions 狀態機
   ├─ Analyze        (analyze_handler：時間軸 + 程序審查 + 健檢)
   │     └─ Choice：不受理 → QuickTemplate → 存 S3 → 結束
   ├─ Retrieve       (retrieve_handler：法規推薦 + 相似案例)
-  ├─ WaitForApproval(等待承辦人在介面確認主文，callback token)
   ├─ Draft          (draft_handler，呼叫 Bedrock)
   └─ Verify         (verify_handler：驗證 + 對抗式審查)
       │

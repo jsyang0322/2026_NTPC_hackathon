@@ -4,7 +4,7 @@
   "States": {
     "Analyze": {
       "Type": "Task",
-      "Comment": "路由 + KB 檢索 + 建議主文（analyze_handler）",
+      "Comment": "路由 + KB 檢索 + 自動判定主文（analyze_handler）",
       "Resource": "arn:aws:lambda:us-west-2:ACCOUNT_ID:function:ntpc-analyze",
       "Next": "IsInadmissible"
     },
@@ -18,28 +18,15 @@
           "Next": "InadmissibleDone"
         }
       ],
-      "Default": "WaitForApproval"
+      "Default": "Draft"
     },
     "InadmissibleDone": {
       "Type": "Succeed",
-      "Comment": "不受理快速通道：analyze_handler 已產出模板草稿"
-    },
-    "WaitForApproval": {
-      "Type": "Task",
-      "Comment": "★ 等待承辦人在介面確認主文（人保留決定權）。以 callback token 暫停，由前端 SendTaskSuccess 帶回 confirmed_disposition。",
-      "Resource": "arn:aws:states:::lambda:invoke.waitForTaskToken",
-      "Parameters": {
-        "FunctionName": "ntpc-request-approval",
-        "Payload": {
-          "analysis.$": "$",
-          "taskToken.$": "$$.Task.Token"
-        }
-      },
-      "Next": "Draft"
+      "Comment": "不受理快速通道：analyze_handler 已產出模板草稿（0 次 Bedrock 呼叫）"
     },
     "Draft": {
       "Type": "Task",
-      "Comment": "依確認主文撰寫草稿（draft_handler，呼叫 Bedrock Claude）",
+      "Comment": "依 analysis.decided_disposition 撰寫草稿（draft_handler，呼叫 Bedrock Claude）。v1.3 全自動，無人工確認",
       "Resource": "arn:aws:lambda:us-west-2:ACCOUNT_ID:function:ntpc-draft",
       "Retry": [
         {
