@@ -3,7 +3,7 @@
 流程（v1.3：移除人工確認，端到端自動產出）：
   前段 JSON → Router(route_key)
             → analyze_case（KB 檢索：法規 + 相似案例；自動判定主文）
-            → generate_case_draft（撰稿 → 規則驗證 → 對抗式審查）
+            → generate_case_draft（撰稿 → 規則驗證 → 法官審查 → 有限重寫）
             → 輸出：草稿 + 檢核報告
 
 主文判定原則（_decide_disposition）：
@@ -11,11 +11,13 @@
   2. 原處分健檢有紅燈 → 原處分撤銷，另為適法之處分
   3. 否則依相似案例主文多數決；無資料時預設訴願駁回
 
-品質把關改由機器承擔：verify_draft（純規則）+ adversarial_review（對抗式審查）
-的結果一併輸出，blocking 非空即代表該件需要注意，但不阻斷流程。
+品質把關全由機器承擔（無人工閘門）：
+  - verify_draft（純規則）：客觀問題，紅燈轉 issues 觸發重寫
+  - adversarial_review（法官）：論理弱點，high severity 觸發重寫
+  - 重寫上限 1 次；仍不過則標 needs_human_review 供事後抽查，不阻斷輸出
 
 RAG 走 Bedrock KB（路線 A）。所有 LLM / KB 呼叫走 bedrock_client（≤1 RPS）。
-單件呼叫預算：檢索 1 + 撰稿 1 + 對抗式審查 1–2 ≈ 3–4 次；不受理案 0 次。
+單件呼叫預算：檢索 1 + 撰稿 1 + 法官 1 = 3 次；觸發重寫最壞 5 次；不受理案 0 次。
 """
 
 from __future__ import annotations
@@ -94,46 +96,73 @@ def analyze_case(payload: dict, client=None) -> dict:
     }
 
 
-def generate_case_draft(analysis: dict, disposition: str | None = None, client=None) -> dict:
-    """步驟二：依判定主文撰稿，並跑規則驗證 + 對抗式審查。
+def generate_case_draft(analysis: dict, disposition: str | None = None,
+                       client=None, max_rewrites: int = 1) -> dict:
+    """步驟二：對抗式審查迴圈——生成 → 規則檢查 → 法官審查 →（有問題）有限重寫。
 
-    disposition 未指定時採用 analysis 自動判定的主文（正常路徑）。
-    保留此參數供批次重跑或人工覆寫特定案件時使用，主線不會用到。
+    流程（§11.2）：
+      1. 生成草稿（1 次呼叫）
+      2. verify 規則檢查（0 次，純程式，先擋客觀問題並產出 issues）
+      3. critic 法官對抗式審查（1 次呼叫）
+      4. 規則紅燈或法官指出重大問題 → 帶意見重寫（≤ max_rewrites 次，預設 1）
+      5. 仍不過 → 標 needs_human_review，但仍輸出（全自動不阻斷）
+
+    呼叫數：正常 2 次（撰稿 + 法官）；觸發重寫最壞 4 次。加上 analyze 的 KB 檢索 1 次，
+    單件合計 3–5 次，守 §13.3 上限。
+
+    disposition 未指定時採用 analysis 自動判定的主文（正常路徑）；
+    保留此參數供批次重跑或特定案件覆寫，主線不會用到。
     """
     client = client or get_client()
     used = disposition or analysis.get("decided_disposition", DISPOSITION_DISMISS)
+    fields = analysis.get("fields", {})
+    laws = analysis.get("recommended_laws", [])
+    sims = analysis.get("similar_cases", [])
+    defects = analysis.get("defects", [])
 
+    # 不受理快速通道：套模板，不呼叫 LLM，也不進審查迴圈
     if analysis.get("inadmissible"):
-        # 不受理快速通道：套模板，不呼叫 LLM，也不做對抗式審查
         d = draft.quick_template({}, {})
-        report = verify.verify_draft(
-            d, analysis.get("fields", {}), analysis.get("recommended_laws", []),
-            {}, analysis.get("defects", []),
-        )
+        report = verify.verify_draft(d, fields, laws, {}, defects)
         return {
-            "draft": d, "verification": report,
-            "adversarial": {"attacks": [], "revocation_risk": "n/a",
+            "draft": d,
+            "verification": report,
+            "adversarial": {"passed": True, "attacks": [], "revocation_risk": "n/a",
                             "note": "不受理案件未進實體審查，不做對抗式審查"},
             "disposition": used, "decided_by": "auto",
-            "bedrock_calls_estimate": 0,
+            "rewrite_count": 0, "needs_human_review": False,
+            "quality_flags": [], "bedrock_calls_estimate": 0,
         }
 
-    d = draft.generate_draft(
-        analysis["route_key"], used, analysis["fields"],
-        analysis.get("recommended_laws", []), analysis.get("similar_cases", []),
-        analysis.get("defects", []), client=client,
-    )
-    report = verify.verify_draft(
-        d, analysis["fields"], analysis.get("recommended_laws", []), {}, analysis.get("defects", []),
-    )
-    review = critic.adversarial_review(d, analysis["fields"], client=client)
+    # 1) 第一版
+    d = draft.generate_draft(analysis["route_key"], used, fields, laws, sims, defects, client=client)
+
+    rewrite_count = 0
+    while True:
+        report = verify.verify_draft(d, fields, laws, {}, defects)     # 規則層（0 次）
+        review = critic.adversarial_review(d, fields, client=client)   # 法官（1 次）
+
+        if not critic.has_blocking_issue(review, report.get("issues", [])):
+            break
+        if rewrite_count >= max_rewrites:
+            break
+
+        # 2) 帶規則問題 + 法官意見重寫（1 次）
+        feedback = critic.collect_feedback(review, report.get("issues", []))
+        d = draft.generate_draft(analysis["route_key"], used, fields, laws, sims, defects,
+                                 client=client, prev_draft=d, feedback=feedback)
+        rewrite_count += 1
+
+    needs_human = critic.has_blocking_issue(review, report.get("issues", []))
     return {
         "draft": d,
         "verification": report,
         "adversarial": review,
         "disposition": used,
         "decided_by": "auto",
-        "quality_flags": _quality_flags(analysis, report, review),
+        "rewrite_count": rewrite_count,
+        "needs_human_review": needs_human,
+        "quality_flags": _quality_flags(analysis, report, review, rewrite_count),
     }
 
 
@@ -200,17 +229,22 @@ def _normalize_disposition(text: str) -> str | None:
     return None
 
 
-def _quality_flags(analysis: dict, report: dict, review: dict) -> list[str]:
+def _quality_flags(analysis: dict, report: dict, review: dict, rewrite_count: int = 0) -> list[str]:
     """彙整需要注意的訊號。全自動流程不阻斷，但把風險標出來供事後抽查。"""
     flags: list[str] = []
     if analysis.get("need_human_review"):
         flags.append("前段分類信心不足（need_human_review）")
     blocking = report.get("blocking") or []
     if blocking:
-        flags.append(f"驗證紅燈未通過：{blocking}")
+        flags.append(f"重寫後仍有驗證紅燈：{blocking}" if rewrite_count
+                     else f"驗證紅燈未通過：{blocking}")
+    if not review.get("passed", True):
+        flags.append("法官對抗式審查未通過")
     risk = str(review.get("revocation_risk", ""))
     if risk in ("high", "medium"):
         flags.append(f"對抗式審查撤銷風險：{risk}")
+    if rewrite_count:
+        flags.append(f"已自動重寫 {rewrite_count} 次")
     return flags
 
 

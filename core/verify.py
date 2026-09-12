@@ -5,12 +5,15 @@
 
 設計原則
 --------
-1. **只出報告，不自動重寫**：v1.3 流程全自動，本層輸出 blocking 清單與 quality_flags
-   供事後抽查，不回頭重生草稿（避免多一輪 LLM 呼叫，也保留可稽核的原始產出）。
+1. **本層只判斷、不改稿**：判斷結果分兩路輸出——
+   `blocking`/`summary` 給人看（介面與事後抽查）、`issues` 給機器用
+   （pipeline 的對抗式審查迴圈據以決定是否重寫，並塞回重寫 prompt）。
+   改稿動作由 draft.generate_draft 的重寫模式執行，不在此模組。
 2. **分三級**：red（必須處理，如引用捏造）/ amber（提醒複核）/ green（通過），
-   與 §7 健檢的紅黃綠燈一致。
+   與 §7 健檢的紅黃綠燈一致。只有 red 會進 `issues` 觸發重寫，
+   amber 僅提示，避免為語意模糊的項目多花一次 Bedrock 呼叫。
 3. **資料不足時回 skipped，不回 fail**：骨架階段（KB 結果未結構化、教示決定表未接、
-   version_db 未建）不應產生假紅燈，否則報告失去訊號價值。
+   version_db 未建）不應產生假紅燈，否則報告失去訊號價值，也會誤觸發重寫。
 
 補償定位（§4.5）：路線 A 走純語意檢索，中文條號精確度不足（「第15條之2」可能被抓成
 「15」）。本模組的 V2/V3 正則校驗即為該風險的事後補償點。
@@ -127,9 +130,10 @@ def verify_draft(draft: dict, fields: dict, recommended_laws: list[dict],
         {
           "checks": [{id, name, passed, status, level, detail, evidence}],
           "all_passed": bool,        # 無任何 fail（紅或黃）
-          "blocking_passed": bool,   # 無紅燈 fail，可否進入定稿的硬門檻
+          "blocking_passed": bool,   # 無紅燈 fail
           "summary": {...},
           "blocking": [check_id, ...],
+          "issues": [str, ...],      # 紅燈的人語句，供重寫迴圈塞回 prompt
         }
     """
     paragraphs = _iter_paragraphs(draft)
@@ -162,7 +166,37 @@ def verify_draft(draft: dict, fields: dict, recommended_laws: list[dict],
         "blocking_passed": not blocking,
         "summary": summary,
         "blocking": blocking,
+        # 對抗式審查迴圈的規則層訊號（critic.has_blocking_issue / collect_feedback 取用）
+        "issues": _build_issues(fails),
     }
+
+
+def _build_issues(fails: list[dict]) -> list[str]:
+    """把失敗項轉成可塞回重寫 prompt 的人語句。
+
+    只收紅燈（客觀且必須修）。黃燈屬提醒複核，不觸發重寫，避免為了語意模糊的
+    項目多花一次 Bedrock 呼叫。
+    """
+    issues: list[str] = []
+    for c in fails:
+        if c["level"] != "red":
+            continue
+        fix = _FIX_HINTS.get(c["id"], "")
+        evidence = f"（涉及：{c['evidence']}）" if c.get("evidence") else ""
+        issues.append(f"{c['name']}未通過：{c['detail']}{evidence}{fix}")
+    return issues
+
+
+#: 各檢核項失敗時，給重寫模型的具體修正方向
+_FIX_HINTS = {
+    "V1": " 請僅使用【可引用法條】清單內的條文，刪除清單外的引用。",
+    "V3": " 請將條號寫完整（例如「第15條之2」不可寫成「第15條之」或「第條」）。",
+    "V4": " 請為未回應的主張各補一段回應，並於 responds_to 標注其編號。",
+    "V5": " 請改引用行為時有效之條文版本。",
+    "V7": " 請確認訴願期間計算，並使主文與程序判斷一致。",
+    "V8": " 請依現行審判機關名稱與 2 個月起訴期間更正教示。",
+    "V9": " 請調整理由結論用語，使其與主文方向一致。",
+}
 
 
 # ---------------------------------------------------------------------------

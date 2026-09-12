@@ -8,7 +8,13 @@
 v1.3 起流程全自動：主文由 pipeline._decide_disposition() 自動判定後傳入，
 本模組只負責「依既定主文寫理由」，不自行變更結論方向（主文理由一致性由 verify V9 把關）。
 
-單件呼叫預算（§5）：KB 檢索 1 + 撰寫 1 + 對抗式審查 1–2 = 約 3–4 次，可控。
+兩種模式：
+  - 初次生成：generate_draft(...)
+  - 重寫模式：generate_draft(..., prev_draft=上一版, feedback=審查意見)
+    由對抗式審查迴圈觸發，僅修正被指出的段落。
+
+單件呼叫預算（§5）：KB 檢索 1 + 撰寫 1 + 法官審查 1 = 3 次；
+觸發重寫時 +2（重寫 1 + 再審 1），最壞 5 次，仍守 ≤1 RPS 與 §13.3 上限。
 """
 
 from __future__ import annotations
@@ -59,9 +65,14 @@ def get_profile(route_key: str | None) -> dict:
 
 
 def build_draft_prompt(disposition: str, fields: dict, recommended_laws: list[dict],
-                       similar_cases: list[dict], defects: list[dict], profile: dict) -> str:
-    """組 §10.5 的 prompt。KB 檢索到的法條/案例由此塞入。"""
-    return (
+                       similar_cases: list[dict], defects: list[dict], profile: dict,
+                       prev_draft: dict | None = None, feedback: str = "") -> str:
+    """組 §10.5 的 prompt。KB 檢索到的法條/案例由此塞入。
+
+    重寫模式（prev_draft + feedback）：帶入上一版與規則/法官意見，要求僅針對問題修正，
+    保留其餘正確段落，避免整篇重寫又引入新問題。
+    """
+    base = (
         "你是新北市政府訴願審議委員會的撰稿輔助人員。"
         f"{profile['writing_style']}\n"
         "請依下列資料撰寫理由欄「涵攝與逐項回應」段落。\n\n"
@@ -71,6 +82,16 @@ def build_draft_prompt(disposition: str, fields: dict, recommended_laws: list[di
         f"【可引用法條】{json.dumps(recommended_laws, ensure_ascii=False)}（只能引用此清單）\n"
         f"【相似案例論理】{json.dumps(similar_cases, ensure_ascii=False)}\n"
         f"【原處分健檢結果】{json.dumps(defects, ensure_ascii=False)}（紅燈項須在理由中處理）\n\n"
+    )
+    if prev_draft and feedback:
+        base += (
+            "【上一版理由草稿】"
+            + json.dumps(prev_draft.get("reasons", []), ensure_ascii=False) + "\n"
+            "【審查意見（規則檢查與法官提出的問題）】\n" + feedback + "\n\n"
+            "重寫規則：僅針對上述審查意見修正對應段落，保留其餘正確段落的論理與結構，"
+            "不要引入新的問題，也不要變更主文方向。\n"
+        )
+    base += (
         "撰寫規則：\n"
         "1. 逐一回應每項訴願人主張並標注編號。\n"
         "2. 不得引用【可引用法條】以外的法條、函釋或判決字號。\n"
@@ -78,6 +99,7 @@ def build_draft_prompt(disposition: str, fields: dict, recommended_laws: list[di
         '4. 輸出 JSON：{"paragraphs":[{"text":"...","responds_to":["C1"],'
         '"cites":["洗錢防制法§22"],"based_on_case":"doc_id"}]}\n'
     )
+    return base
 
 
 def generate_draft(
@@ -88,12 +110,19 @@ def generate_draft(
     similar_cases: list[dict],
     defects: list[dict],
     client: BedrockClient | None = None,
+    prev_draft: dict | None = None,
+    feedback: str = "",
 ) -> dict:
-    """依判定主文與 route_key 生成草稿。★ 一次 client.converse 呼叫 Claude。"""
+    """依判定主文與 route_key 生成草稿。★ 一次 client.converse 呼叫 Claude。
+
+    重寫模式：傳入 prev_draft + feedback，模型僅針對審查意見修正
+    （對抗式審查迴圈用，見 pipeline.generate_case_draft）。
+    """
     client = client or get_client()
     profile = get_profile(route_key)
     prompt = build_draft_prompt(
-        disposition, fields, recommended_laws, similar_cases, defects, profile
+        disposition, fields, recommended_laws, similar_cases, defects, profile,
+        prev_draft=prev_draft, feedback=feedback,
     )
     text = client.converse(
         messages=[{"role": "user", "content": [{"text": prompt}]}],
@@ -108,6 +137,7 @@ def generate_draft(
         "source": "llm",
         "route_key": route_key,
         "profile_label": profile["label"],
+        "revised": bool(prev_draft and feedback),
     }
 
 
