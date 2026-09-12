@@ -24,6 +24,11 @@ models/*.joblib
 *.faiss
 *.npy
 
+# === Henry pipeline 可重建的執行輸出 ===
+henry/output_json/
+henry/*_predictions*.jsonl
+henry/*_report*.txt
+
 # === OS ===
 .DS_Store
 Thumbs.db

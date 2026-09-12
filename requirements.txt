@@ -1,6 +1,7 @@
 # === 核心執行（單體應用 / Lambda 共用）===
 boto3>=1.34.0            # AWS SDK：Bedrock、S3
 pymupdf>=1.24.0          # PDF 解析（§4.1，不使用 Textract）
+pypdf>=5.0.0             # Henry pipeline 的 PDF 文字擷取
 
 # === 檢索 / 分類（本機或 SageMaker Notebook）===
 scikit-learn>=1.4.0      # TF-IDF + LogisticRegression 案由分類（§5.3）
