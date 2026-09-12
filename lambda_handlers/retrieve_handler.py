@@ -27,7 +27,7 @@ def handler(event, context=None):
     analysis["recommended_laws"] = recommend_laws(route_key, q, client=client)
     analysis["similar_cases"] = find_similar(route_key, q, client=client)
     _s3io.write_json(event["bucket"], event["key"], analysis)
-    return {"bucket": event["bucket"], "key": event["key"], "next": "await_confirm"}
+    return {"bucket": event["bucket"], "key": event["key"], "next": "draft"}
 
 
 def _rebuild_query(analysis: dict) -> str:

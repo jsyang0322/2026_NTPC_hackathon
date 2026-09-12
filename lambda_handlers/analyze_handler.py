@@ -1,8 +1,8 @@
-"""Lambda ②：分析（路由 + KB 檢索 + 建議主文）。
+"""Lambda ②：分析（路由 + KB 檢索 + 自動判定主文）。
 
 呼叫 core.pipeline.analyze_case（內含 router、recommend_laws、similar_cases）。
 事件格式：{"bucket": ..., "key": "input/xxx.json"}
-輸出：analysis/xxx.json，回傳 {"bucket","key","next":"await_confirm"}
+輸出：analysis/xxx.json，回傳 {"bucket","key","next":"draft"|"done"}
 """
 
 from __future__ import annotations
@@ -23,10 +23,11 @@ def handler(event, context=None):
     analysis = analyze_case(payload, client=get_client())
     out_key = event["key"].replace("input/", "analysis/")
     _s3io.write_json(event["bucket"], out_key, analysis)
-    # 若程序不受理，直接結束；否則等待承辦人確認主文
-    nxt = "done" if analysis.get("inadmissible") else "await_confirm"
+    # 程序不受理走快速通道直接結束；否則接續撰稿（v1.3 全自動，無人工確認）
+    nxt = "done" if analysis.get("inadmissible") else "draft"
     return {"bucket": event["bucket"], "key": out_key, "next": nxt,
-            "route_key": analysis.get("route_key")}
+            "route_key": analysis.get("route_key"),
+            "decided_disposition": analysis.get("decided_disposition")}
 
 
 def _test():
