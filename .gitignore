@@ -28,6 +28,9 @@ models/*.joblib
 henry/output_json/
 henry/*_predictions*.jsonl
 henry/*_report*.txt
+# 向量索引：內含 embedding 浮點陣列，每次重建都產生上百 KB 的不可讀 diff，
+# 且容易造成合併衝突。以 `python rag_triage.py build` 重建即可。
+henry/kb_index.json
 
 # === OS ===
 .DS_Store

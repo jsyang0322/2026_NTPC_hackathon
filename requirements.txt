@@ -4,13 +4,13 @@ pymupdf>=1.24.0          # PDF 解析（§4.1，不使用 Textract）
 pypdf>=5.0.0             # Henry pipeline 的 PDF 文字擷取
 
 # === 檢索 / 分類（本機或 SageMaker Notebook）===
-scikit-learn>=1.4.0      # TF-IDF + LogisticRegression 案由分類（§5.3）
-rank-bm25>=0.2.2         # BM25 關鍵字檢索（§9.2）
-numpy>=1.26.0            # 向量運算、記憶體索引
+scikit-learn>=1.4.0      # 案由分類（§5.3）；henry/make_and_upload.py 亦用其資料集
+numpy>=1.26.0            # 向量運算（henry/rag_triage.py 的相似度計算）
 
-# === 介面 / 匯出 ===
+# === 介面 ===
 streamlit>=1.34.0        # 審閱介面（§14，單體 Demo）
-python-docx>=1.1.0       # Word 匯出（§14.2，開賽前驗證註解功能）
 
-# === 開發輔助 ===
-python-dateutil>=2.9.0   # 民國/西元日期、期間計算（§6）
+# === 規劃中：尚未被任何模組 import，實作對應功能時再取消註解 ===
+# rank-bm25>=0.2.2       # 已不需要：改走路線 A（Bedrock KB 語意檢索），不自建 BM25
+# python-docx>=1.1.0     # Word 匯出（§14.2），待實作
+# python-dateutil>=2.9.0 # 民國/西元日期與期間計算（§6），timeline/procedure 實作時需要
