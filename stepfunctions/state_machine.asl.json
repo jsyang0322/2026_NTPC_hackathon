@@ -1,0 +1,61 @@
+{
+  "Comment": "訴願草稿撰寫與檢查 pipeline（正式架構）。各步驟為獨立 Lambda，共用 core 函式；Bedrock ≤1 RPS 由各 Lambda 內 bedrock_client 限流保證。",
+  "StartAt": "Analyze",
+  "States": {
+    "Analyze": {
+      "Type": "Task",
+      "Comment": "路由 + KB 檢索 + 建議主文（analyze_handler）",
+      "Resource": "arn:aws:lambda:us-west-2:ACCOUNT_ID:function:ntpc-analyze",
+      "Next": "IsInadmissible"
+    },
+    "IsInadmissible": {
+      "Type": "Choice",
+      "Comment": "程序不受理 → 直接產不受理草稿並結束；否則進入實體審查",
+      "Choices": [
+        {
+          "Variable": "$.next",
+          "StringEquals": "done",
+          "Next": "InadmissibleDone"
+        }
+      ],
+      "Default": "WaitForApproval"
+    },
+    "InadmissibleDone": {
+      "Type": "Succeed",
+      "Comment": "不受理快速通道：analyze_handler 已產出模板草稿"
+    },
+    "WaitForApproval": {
+      "Type": "Task",
+      "Comment": "★ 等待承辦人在介面確認主文（人保留決定權）。以 callback token 暫停，由前端 SendTaskSuccess 帶回 confirmed_disposition。",
+      "Resource": "arn:aws:states:::lambda:invoke.waitForTaskToken",
+      "Parameters": {
+        "FunctionName": "ntpc-request-approval",
+        "Payload": {
+          "analysis.$": "$",
+          "taskToken.$": "$$.Task.Token"
+        }
+      },
+      "Next": "Draft"
+    },
+    "Draft": {
+      "Type": "Task",
+      "Comment": "依確認主文撰寫草稿（draft_handler，呼叫 Bedrock Claude）",
+      "Resource": "arn:aws:lambda:us-west-2:ACCOUNT_ID:function:ntpc-draft",
+      "Retry": [
+        {
+          "ErrorEquals": ["ThrottlingException", "States.TaskFailed"],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 5,
+          "BackoffRate": 2.0
+        }
+      ],
+      "Next": "Verify"
+    },
+    "Verify": {
+      "Type": "Task",
+      "Comment": "規則驗證 + 對抗式審查（verify_handler）",
+      "Resource": "arn:aws:lambda:us-west-2:ACCOUNT_ID:function:ntpc-verify",
+      "End": true
+    }
+  }
+}
