@@ -56,24 +56,53 @@ def analyze_case(payload: dict, client=None) -> dict:
     }
 
 
-def generate_case_draft(analysis: dict, disposition: str | None = None, client=None) -> dict:
-    """步驟二：用（建議或指定）主文生成完整草稿，並跑驗證 + 對抗式審查。
+def generate_case_draft(analysis: dict, disposition: str | None = None,
+                        client=None, max_rewrites: int = 1) -> dict:
+    """步驟二：對抗式審查迴圈——生成 → 規則檢查 → 法官審查 →（有問題）有限重寫。
 
-    disposition 未指定時採用 analysis 的建議主文。回傳含 draft / verification /
-    adversarial / used_disposition，供承辦人審閱。
+    設計（§11.2）：
+      1. 生成草稿（1 次呼叫）
+      2. verify 規則檢查（0 次，純程式，先擋客觀問題）
+      3. critic 法官對抗式審查（1 次呼叫）
+      4. 若規則或法官指出重大問題 → 帶意見重寫（≤ max_rewrites 次，預設 1）
+      5. 仍不過 → 標「建議人工複核」，仍輸出
+
+    呼叫數：正常 2 次；最壞（重寫 1 次）4 次。守 §13.3 的單件 ≤5。
+    回傳含 draft / verification / adversarial / used_disposition / rewrite_count /
+    needs_human_review。
     """
     client = client or get_client()
+    rk = analysis["route_key"]
+    fields = analysis["fields"]
+    laws = analysis.get("recommended_laws", [])
+    sims = analysis.get("similar_cases", [])
+    defects = analysis.get("defects", [])
     used = disposition or analysis.get("suggested_disposition", "")
-    d = draft.generate_draft(
-        analysis["route_key"], used, analysis["fields"],
-        analysis.get("recommended_laws", []), analysis.get("similar_cases", []),
-        analysis.get("defects", []), client=client,
-    )
-    report = verify.verify_draft(
-        d, analysis["fields"], analysis.get("recommended_laws", []), {}, analysis.get("defects", []),
-    )
-    review = critic.adversarial_review(d, analysis["fields"], client=client)
-    return {"draft": d, "verification": report, "adversarial": review, "used_disposition": used}
+
+    # 1) 第一版
+    d = draft.generate_draft(rk, used, fields, laws, sims, defects, client=client)
+
+    rewrite_count = 0
+    while True:
+        report = verify.verify_draft(d, fields, laws, {}, defects)      # 規則層（0 次）
+        review = critic.adversarial_review(d, fields, client=client)     # 法官（1 次）
+
+        blocking = critic.has_blocking_issue(review, report.get("issues", []))
+        if not blocking or rewrite_count >= max_rewrites:
+            break
+
+        # 2) 帶意見重寫（1 次）
+        feedback = critic.collect_feedback(review, report.get("issues", []))
+        d = draft.generate_draft(rk, used, fields, laws, sims, defects,
+                                 client=client, prev_draft=d, feedback=feedback)
+        rewrite_count += 1
+
+    needs_human = critic.has_blocking_issue(review, report.get("issues", []))
+    return {
+        "draft": d, "verification": report, "adversarial": review,
+        "used_disposition": used, "rewrite_count": rewrite_count,
+        "needs_human_review": needs_human,
+    }
 
 
 def confirm_disposition(analysis: dict, draft_result: dict, confirmed_disposition: str, client=None) -> dict:

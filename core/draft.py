@@ -56,9 +56,13 @@ def get_profile(route_key: str | None) -> dict:
 
 
 def build_draft_prompt(confirmed_disposition: str, fields: dict, recommended_laws: list[dict],
-                       similar_cases: list[dict], defects: list[dict], profile: dict) -> str:
-    """組 §10.5 的 prompt。KB 檢索到的法條/案例由此塞入。"""
-    return (
+                       similar_cases: list[dict], defects: list[dict], profile: dict,
+                       prev_draft: dict | None = None, feedback: str = "") -> str:
+    """組 §10.5 的 prompt。KB 檢索到的法條/案例由此塞入。
+
+    重寫模式（prev_draft + feedback）：帶入上一版與法官/規則意見，要求僅針對問題修正。
+    """
+    base = (
         "你是新北市政府訴願審議委員會的撰稿輔助人員。"
         f"{profile['writing_style']}\n"
         "請依下列資料撰寫理由欄「涵攝與逐項回應」段落。\n\n"
@@ -68,6 +72,15 @@ def build_draft_prompt(confirmed_disposition: str, fields: dict, recommended_law
         f"【可引用法條】{json.dumps(recommended_laws, ensure_ascii=False)}（只能引用此清單）\n"
         f"【相似案例論理】{json.dumps(similar_cases, ensure_ascii=False)}\n"
         f"【原處分健檢結果】{json.dumps(defects, ensure_ascii=False)}（紅燈項須在理由中處理）\n\n"
+    )
+    if prev_draft and feedback:
+        base += (
+            "【上一版理由草稿】" + json.dumps(prev_draft.get("reasons", []), ensure_ascii=False) + "\n"
+            "【審查意見（法官與規則檢查提出的問題）】\n" + feedback + "\n\n"
+            "重寫規則：僅針對上述審查意見修正對應段落，保留其餘正確段落的論理與結構，"
+            "不要引入新的問題。\n"
+        )
+    base += (
         "撰寫規則：\n"
         "1. 逐一回應每項訴願人主張並標注編號。\n"
         "2. 不得引用【可引用法條】以外的法條、函釋或判決字號。\n"
@@ -75,6 +88,7 @@ def build_draft_prompt(confirmed_disposition: str, fields: dict, recommended_law
         '4. 輸出 JSON：{"paragraphs":[{"text":"...","responds_to":["C1"],'
         '"cites":["洗錢防制法§22"],"based_on_case":"doc_id"}]}\n'
     )
+    return base
 
 
 def generate_draft(
@@ -85,12 +99,18 @@ def generate_draft(
     similar_cases: list[dict],
     defects: list[dict],
     client: BedrockClient | None = None,
+    prev_draft: dict | None = None,
+    feedback: str = "",
 ) -> dict:
-    """依已確認主文與 route_key 生成草稿。★ 一次 client.converse 呼叫 Claude。"""
+    """依已確認主文與 route_key 生成草稿。★ 一次 client.converse 呼叫 Claude。
+
+    重寫模式：傳入 prev_draft + feedback，模型僅針對審查意見修正（對抗式審查迴圈用）。
+    """
     client = client or get_client()
     profile = get_profile(route_key)
     prompt = build_draft_prompt(
-        confirmed_disposition, fields, recommended_laws, similar_cases, defects, profile
+        confirmed_disposition, fields, recommended_laws, similar_cases, defects, profile,
+        prev_draft=prev_draft, feedback=feedback,
     )
     text = client.converse(
         messages=[{"role": "user", "content": [{"text": prompt}]}],
@@ -105,6 +125,7 @@ def generate_draft(
         "source": "llm",
         "route_key": route_key,
         "profile_label": profile["label"],
+        "revised": bool(prev_draft and feedback),
     }
 
 
