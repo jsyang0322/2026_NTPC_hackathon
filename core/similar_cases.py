@@ -58,6 +58,7 @@ def find_similar(
         include_common_law=False,   # 歷史案例不摻共通法規
         num_results=max(top_k * 4, 20),
         client=client,
+        filter_case_type=False,     # 共池：案由當加權特徵，不當過濾條件（§9.2）
     )
     cases = [_structure(h, route_key) for h in (hits or []) if isinstance(h, dict)]
     cases.sort(key=lambda c: c["similarity"], reverse=True)
