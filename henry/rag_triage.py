@@ -41,21 +41,42 @@ sess = boto3.Session(region_name=REGION)
 s3 = sess.client("s3")
 rt = sess.client("bedrock-runtime")
 
+# 限流統一交給 core/bedrock_client 的跨行程閘門（競賽規範 ≤ 1 RPS）。
+# 本模組因使用 invoke_model（Cohere embed / Nova 的 body 格式與 converse 不同）
+# 而保留自己的 boto3 client，但速率控制不自己算——否則本行程與 core 各守 1 RPS，
+# 同時執行時合計 2 RPS，會違反規範。
+sys.path.insert(0, str(BASE_DIR.parent))
+from core.bedrock_client import throttle as _bedrock_throttle  # noqa: E402
+
 _bedrock_lock = threading.Lock()
-_last_bedrock_call = 0.0
 _min_bedrock_interval = float(os.environ.get("BEDROCK_MIN_INTERVAL", "1.05"))
 
 
 def _invoke_model(**kwargs):
-    """Serialize Bedrock calls and keep the process-wide request rate at <= 1 RPS."""
-    global _last_bedrock_call
+    """本模組所有 Bedrock 呼叫的唯一出口。
+
+    行程內以 _bedrock_lock 序列化；跨行程速率由 core 的共用閘門保證。
+    """
     with _bedrock_lock:
-        wait = _min_bedrock_interval - (time.monotonic() - _last_bedrock_call)
-        if wait > 0:
-            time.sleep(wait)
-        response = rt.invoke_model(**kwargs)
-        _last_bedrock_call = time.monotonic()
-        return response
+        _bedrock_throttle(_min_bedrock_interval)
+        return rt.invoke_model(**kwargs)
+
+
+def set_model(model_id, read_timeout=90, connect_timeout=10, max_attempts=2):
+    """切換本模組使用的 LLM，並重建 client（為 Claude 加逾時避免卡住）。
+
+    bedrock-runtime client 只在本模組建立，其他模組請呼叫本函式而非自行建 client——
+    否則呼叫會繞過 _invoke_model 的限流閘門，可能超過競賽規範的 1 RPS。
+    """
+    global LLM_MODEL, rt
+    from botocore.config import Config
+
+    LLM_MODEL = model_id
+    rt = sess.client(
+        "bedrock-runtime",
+        config=Config(read_timeout=read_timeout, connect_timeout=connect_timeout,
+                      retries={"max_attempts": max_attempts}),
+    )
 
 
 # ---------- Bedrock helpers ----------

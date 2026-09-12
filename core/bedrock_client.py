@@ -1,9 +1,17 @@
 """所有 LLM / Bedrock 呼叫的唯一入口。
 
-競賽硬性規定：Amazon Bedrock 請求須 ≤ 1 RPS。
-本模組以全域 token bucket 強制限流，並提供快取與指數退避重試。
+競賽硬性規定：Amazon Bedrock 請求須 ≤ 1 RPS（原文：每秒 1 個請求以下）。
+
+限流有兩層，缺一不可：
+  1. 行程內：threading.Lock，處理同一行程的多執行緒。
+  2. 跨行程：檔案鎖 + 時間戳（見 throttle()），處理「同一台機器上多個 Python
+     行程同時呼叫 Bedrock」的情況——例如 Streamlit 介面與 henry/ 的批次腳本
+     同時執行。若只有行程內限流，兩邊各自守 1 RPS，合計卻是 2 RPS，違反規範。
+
 extract / issues / defects / draft / critic / similar_cases 等模組
 一律透過此 client 呼叫，不得直接 import boto3 打 Bedrock。
+若某支程式因 API 形狀不同必須自行呼叫 boto3（如 henry/rag_triage.py 用
+invoke_model），至少須在呼叫前呼叫本模組的 throttle()，共用同一個閘門。
 
 設計為「不綁環境」：單體應用與 Lambda 都能直接使用同一個實例。
 """
@@ -13,6 +21,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import tempfile
 import time
 import threading
 from dataclasses import dataclass, field
@@ -29,6 +38,112 @@ EMBED_MODEL = os.environ.get("BEDROCK_EMBED_MODEL", "cohere.embed-multilingual-v
 
 AWS_REGION = os.environ.get("AWS_REGION", "us-west-2")
 
+# 全專案共用的最小呼叫間隔（秒）。1.05 而非 1.0 是留安全邊際，實測約 0.95 RPS。
+MIN_INTERVAL = float(os.environ.get("BEDROCK_MIN_INTERVAL", "1.05"))
+
+
+# ===========================================================================
+# 跨行程限流閘門
+# ===========================================================================
+# 為什麼需要：行程內的 Lock 只能協調同一個 Python 行程。競賽規範限制的是「整個
+# 帳號對 Bedrock 的請求速率」，因此只要有兩個行程同時跑（Streamlit + 批次腳本），
+# 行程內限流就失效。以下用「原子建目錄」當跨行程互斥鎖，配一個時間戳檔記錄上次
+# 呼叫時刻。os.mkdir 在 POSIX 與 Windows 皆為原子操作，不需 fcntl（Windows 沒有）。
+
+#: 閘門狀態存放位置。預設放系統暫存目錄，讓同機所有行程共用，且不會被 commit。
+_RATE_STATE = Path(os.environ.get(
+    "BEDROCK_RATE_STATE", Path(tempfile.gettempdir()) / "ntpc_appeal_bedrock_rate"))
+
+#: 鎖被視為陳舊（持有者可能已崩潰）的秒數，超過即強制回收。
+_STALE_LOCK_SECONDS = 30.0
+
+#: 等不到鎖的上限秒數；逾時採保守作法（照睡一個間隔）而非直接放行。
+_GATE_TIMEOUT = 60.0
+
+_local_lock = threading.Lock()
+
+
+def _lock_dir() -> Path:
+    return Path(str(_RATE_STATE) + ".lock")
+
+
+def _stamp_file() -> Path:
+    return Path(str(_RATE_STATE) + ".stamp")
+
+
+def throttle(min_interval: float | None = None) -> None:
+    """在呼叫 Bedrock 前等待，確保同機所有行程合計 ≤ 1 RPS。
+
+    任何無法透過 BedrockClient.converse 的呼叫（例如 KB Retrieve、
+    henry/rag_triage.py 的 invoke_model）都應在呼叫前先呼叫本函式。
+
+    以 wall-clock 時間記錄跨行程狀態（monotonic 不可跨行程比較）。
+    """
+    interval = MIN_INTERVAL if min_interval is None else min_interval
+    with _local_lock:                       # 先擋同行程的其他執行緒
+        if not _acquire(interval):
+            time.sleep(interval)            # 取不到鎖：保守等一個間隔
+            return
+        try:
+            last = _read_stamp()
+            wait = interval - (time.time() - last)
+            if wait > 0:
+                time.sleep(wait)
+            _write_stamp(time.time())
+        finally:
+            _release()
+
+
+def _acquire(interval: float) -> bool:
+    """取得跨行程鎖。回傳 False 表示逾時未取得。"""
+    lock = _lock_dir()
+    lock.parent.mkdir(parents=True, exist_ok=True)
+    deadline = time.time() + _GATE_TIMEOUT
+    while True:
+        try:
+            os.mkdir(lock)                  # 原子操作：成功即代表取得鎖
+            return True
+        except FileExistsError:
+            if _reclaim_if_stale(lock):
+                continue
+            if time.time() > deadline:
+                return False
+            time.sleep(0.02)
+        except OSError:
+            return False                    # 檔案系統不可用時不擋流程
+
+
+def _reclaim_if_stale(lock: Path) -> bool:
+    """持有者崩潰時回收陳舊鎖，避免整批流程卡死。"""
+    try:
+        if time.time() - lock.stat().st_mtime > _STALE_LOCK_SECONDS:
+            os.rmdir(lock)
+            return True
+    except (FileNotFoundError, OSError):
+        return True                         # 鎖剛被釋放，重試即可
+    return False
+
+
+def _release() -> None:
+    try:
+        os.rmdir(_lock_dir())
+    except OSError:
+        pass
+
+
+def _read_stamp() -> float:
+    try:
+        return float(_stamp_file().read_text(encoding="utf-8").strip())
+    except (OSError, ValueError):
+        return 0.0
+
+
+def _write_stamp(ts: float) -> None:
+    try:
+        _stamp_file().write_text(str(ts), encoding="utf-8")
+    except OSError:
+        pass
+
 
 @dataclass
 class BedrockClient:
@@ -41,14 +156,12 @@ class BedrockClient:
         dry_run:      True 時不呼叫真實 Bedrock，回傳 mock，用於骨架驗證與離線測試。
     """
 
-    min_interval: float = 1.05
+    min_interval: float = MIN_INTERVAL
     cache_dir: str = "data/cache"
     max_retries: int = 5
     dry_run: bool = False
     region: str = AWS_REGION
 
-    _last_call: float = field(default=0.0, init=False)
-    _lock: threading.Lock = field(default_factory=threading.Lock, init=False)
     _client: Any = field(default=None, init=False)
 
     def __post_init__(self) -> None:
@@ -62,14 +175,10 @@ class BedrockClient:
             self._client = boto3.client("bedrock-runtime", region_name=self.region)
         return self._client
 
-    # --- 內部：全域限流，確保 ≤ 1 RPS ---
+    # --- 內部：限流，確保 ≤ 1 RPS（行程內 + 跨行程） ---
     def _throttle(self) -> None:
-        with self._lock:
-            elapsed = time.monotonic() - self._last_call
-            wait = self.min_interval - elapsed
-            if wait > 0:
-                time.sleep(wait)
-            self._last_call = time.monotonic()
+        """委派給模組級 throttle()，與其他行程（含 henry/）共用同一個閘門。"""
+        throttle(self.min_interval)
 
     # --- 內部：快取鍵 ---
     @staticmethod

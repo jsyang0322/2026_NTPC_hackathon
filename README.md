@@ -13,7 +13,19 @@
 | AWS Step Functions | 串接多個 Lambda 成狀態機 | 簡報「正式架構」 | 行有餘力 |
 | S3 事件觸發 | 上傳案卷自動啟動 pipeline | 全自動展示 | 行有餘力 |
 
-所有 LLM 呼叫一律走 `core/bedrock_client.py`（**全域 ≤ 1 RPS 限流 + 快取**，競賽硬規定）。
+所有 LLM 呼叫一律走 `core/bedrock_client.py`（**≤ 1 RPS 限流 + 快取**，競賽硬規定）。
+
+限流分兩層，缺一不可：
+
+| 層次 | 機制 | 解決的問題 |
+|---|---|---|
+| 行程內 | `threading.Lock` | 同一行程的多執行緒 |
+| 跨行程 | 檔案鎖 + 時間戳（`bedrock_client.throttle()`） | 多個 Python 行程同時呼叫（如 Streamlit 介面與 `henry/` 批次腳本並跑） |
+
+若只有行程內限流，兩個行程各自守 1 RPS、合計卻是 2 RPS，違反規範。
+因此**任何**無法透過 `BedrockClient.converse()` 的呼叫（KB Retrieve、
+`henry/rag_triage.py` 的 `invoke_model`）都必須先呼叫 `bedrock_client.throttle()`，
+共用同一個閘門。閘門狀態預設放系統暫存目錄，可用 `BEDROCK_RATE_STATE` 覆寫。
 
 ## 目錄結構
 

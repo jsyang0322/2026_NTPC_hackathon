@@ -23,8 +23,7 @@
 """
 import os, sys, json, time
 from pathlib import Path
-import boto3
-from botocore.config import Config
+
 
 import rag_triage as R
 
@@ -34,12 +33,12 @@ BASE_DIR = Path(__file__).resolve().parent
 
 
 def _set_model(model_id):
-    """切換 rag_triage 使用的 LLM,並為 Claude 加上呼叫逾時避免卡住。"""
-    R.LLM_MODEL = model_id
-    R.rt = boto3.Session(region_name=R.REGION).client(
-        "bedrock-runtime",
-        config=Config(read_timeout=90, connect_timeout=10, retries={"max_attempts": 2}),
-    )
+    """切換 rag_triage 使用的 LLM。
+
+    委派給 R.set_model()，不自行建立 bedrock-runtime client——client 統一由
+    rag_triage 管理，確保所有呼叫都經過其限流閘門（競賽規範 ≤ 1 RPS）。
+    """
+    R.set_model(model_id)
 
 
 def _call_with_retry(text, chunks, mat, tries=4):
