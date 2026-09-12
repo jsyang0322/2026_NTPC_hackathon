@@ -38,3 +38,6 @@ Thumbs.db
 
 # === 重要：不可 ignore .kiro（競賽規範第 9 點，需展示 specs/hooks/steering）===
 !.kiro/
+
+# KB 來源轉檔輸出（由 pipeline.kb_ingest_s3 從 S3 重建，約 20MB 純文字）
+data/kb_source/
