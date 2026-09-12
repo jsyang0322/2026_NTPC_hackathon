@@ -62,17 +62,22 @@
   - [x] 8.3 Step Functions 狀態機
   - _需求：R1–R7 的呈現_
 
+- [x] 9. 檢索結果結構化
+  - [x] 9.1 抽出 `core/citations.py`：條號解析與正規化，`recommend_laws` 與 `verify` 共用單一來源
+  - [x] 9.2 `recommend_laws`：輸出 `{citation, law, article, status, doc_type, score, reason, source}`；
+        同條文跨段落合併取最高分
+  - [x] 9.3 `similar_cases`：輸出 `{doc_id, year, similarity, disposition, shared_issues,
+        reasoning_summary, route_match, source}`；同案由加權 1.25 倍（不硬過濾）
+  - [x] 9.4 `verify._allowed_citations` 優先採結構化 `citation` 欄位（精確路徑）
+  - [x] 9.5 驗證：主文多數決可用（舊版無 `disposition` 欄位會靜默落到預設值）
+  - _需求：R2.4；影響：V1 白名單精確度、R3.3 多數決_
+
 ## 待辦
 
-- [ ] 9. 檢索結果結構化（**優先，直接影響 V1 品質**）
-  - [ ] 9.1 `recommend_laws`：把 KB hits 整理成 `{law, article, status, reason, source}`
-  - [ ] 9.2 `similar_cases`：同 `route_key` 加權排序，補 `disposition` / `shared_issues`
-  - _需求：R2.4；影響：V1 白名單目前靠從 raw text 硬撈_
-
-- [ ] 10. 法規版本庫（啟用 V5）
+- [ ] 10. 法規版本庫（啟用 V5 與修正狀態）
   - [ ] 10.1 建條文 + 修正日期 + 條號移列對照，存 S3
-  - [ ] 10.2 實作 `version_db.is_effective(citation, on_date)`
-  - [ ] 10.3 V5 由 skipped 轉為實際檢查
+  - [ ] 10.2 實作 `version_db.is_effective(citation, on_date)` 與 `status_of(citation)`
+  - [ ] 10.3 V5 由 skipped 轉為實際檢查；`recommend_laws` 的 `status` 由 unknown 轉實值
   - _需求：R5「引用條文於行為時有效」_
 
 - [ ] 11. 時間軸與程序審查（啟用 V7 完整判斷）

@@ -8,10 +8,11 @@
 core/
 ├── bedrock_client.py  ★ 所有 Bedrock 呼叫唯一入口（限流/快取/重試）
 ├── schemas.py         ★ 交接契約（route_key 枚舉、驗證）
+├── citations.py       ★ 條號解析與正規化（recommend_laws 與 verify 共用）
 ├── router.py            R1 讀 route_key 分派
 ├── kb.py              ★ R2 Bedrock KB 檢索（metadata 過濾）
-├── recommend_laws.py    R2 法規推薦（案由 OR 共通法規）
-├── similar_cases.py     R2 相似案例（共池 + 加權）
+├── recommend_laws.py    R2 法規推薦（結構化輸出，案由 OR 共通法規）
+├── similar_cases.py     R2 相似案例（結構化輸出，共池 + 案由加權）
 ├── draft.py             R4 草稿生成（CASE_PROFILES + 重寫模式）
 ├── verify.py            R5 規則驗證（V1–V10，0 次呼叫）
 ├── critic.py            R6 對抗式審查（法官）
@@ -100,12 +101,31 @@ CASE_PROFILES[route_key] = {
 
 `skipped` 不算失敗，這是避免骨架階段假紅燈的關鍵。
 
+### 檢索結果結構化
+
+`recommend_laws` / `similar_cases` 輸出**結構化清單**而非 KB 原始 hits。理由不只是整潔：
+
+- `recommend_laws` 若回原始 hits，`verify` 的 V1 白名單只能從自由文字硬撈，
+  會把「檢索段落裡剛好被提到但不該引用」的條文也放進白名單，等於放寬了防捏造檢查。
+  結構化後白名單以 `citation` 欄位為鍵，精確可控。
+- `similar_cases` 若回原始 hits，就沒有 `disposition` 欄位，
+  `pipeline._decide_disposition()` 的主文多數決會**永遠落到預設值**（靜默失效）。
+
+案由加權（`ROUTE_MATCH_BONUS = 1.25`）在應用層做，不在檢索層硬過濾——
+符合「歷史案例共池」原則，同案由加成但不排除其他案由。
+
+主文判不出來時回空字串，不臆測成「駁回」，否則多數決會失真。
+
 ### 條號正規化：白名單比對的基礎
+
+`core/citations.py` 為 `recommend_laws`（產白名單）與 `verify`（比對白名單）**共用**。
+兩邊若各寫一份解析，同一條法規會被寫成不同字串，V1 會把全部引用誤判為清單外——
+這種靜默錯誤很難察覺，所以刻意抽成單一來源。
 
 問題：草稿可能寫 `洗錢防制法§22`，清單可能寫 `{"law":"洗錢防制法","article":"22"}`，
 內文可能寫 `訴願人違反洗錢防制法第22條`。三種形狀要能比對成同一條。
 
-作法：全部經 `_normalize_citation()` 收斂為 `法名第N條[之M]`：
+作法：全部經 `normalize_citation()` 收斂為 `法名第N條[之M]`：
 
 1. regex 同時吃 `§22` / `第22條` / `第15條之2` / `第 22 條`
 2. 法名用 **`KNOWN_LAWS` 註冊表最長後綴匹配**，切掉黏在前面的主詞動詞

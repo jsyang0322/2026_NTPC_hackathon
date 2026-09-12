@@ -24,51 +24,15 @@ from __future__ import annotations
 import re
 from datetime import date
 
+from .citations import (
+    extract_citations as _extract_citations,
+    find_malformed,
+    normalize_citation as _normalize_citation,
+)
+
 # ---------------------------------------------------------------------------
 # 常數與樣式
 # ---------------------------------------------------------------------------
-
-#: 法規名稱結尾（用於從自由文字中辨識法規引用）
-_LAW_SUFFIX = r"(?:法|條例|細則|辦法|規則|準則|通則|標準|要點|自治條例)"
-
-#: 條號引用樣式。同時吃「§22」「第22條」「第15條之2」「第 22 條」等寫法。
-_CITE_RE = re.compile(
-    r"(?P<law>[\u4e00-\u9fff]{1,20}?" + _LAW_SUFFIX + r")\s*"
-    r"(?:"
-    r"§\s*(?P<a1>\d+)(?:\s*[之\-]\s*(?P<s1>\d+))?"
-    r"|第\s*(?P<a2>\d+)\s*條(?:\s*之\s*(?P<s2>\d+))?"
-    r")"
-)
-
-#: 已登錄法規名稱（資料集 11 部 + 常見周邊）。用「最長後綴匹配」把黏在前面的
-#: 主詞與動詞切乾淨，例如「訴願人違反洗錢防制法」→「洗錢防制法」。
-#: 未登錄的法規退回 _strip_leading_noise() 的啟發式剝除，可隨資料集擴充此表。
-KNOWN_LAWS = (
-    # 共通程序法
-    "訴願法", "行政程序法", "行政罰法", "行政訴訟法", "地方制度法",
-    # 三大案由
-    "洗錢防制法", "資恐防制法",
-    "廢棄物清理法", "資源回收再利用法",
-    "空氣污染防制法",
-    # 其他常見案由
-    "建築法", "噪音管制法", "水污染防治法", "土壤及地下水污染整治法",
-    "環境教育法", "菸害防制法", "食品安全衛生管理法",
-    "道路交通管理處罰條例", "電子遊戲場業管理條例", "都市計畫法",
-)
-
-#: 會被 regex 黏進法名的主詞/動詞。未登錄法規時，切在最後一個出現位置之後。
-#: 刻意不含「及／與／或」——「土壤及地下水污染整治法」會被誤切。
-_LAW_NAME_CUT_WORDS = (
-    "訴願人", "原處分機關", "處分機關", "受處分人", "行為人", "申請人", "業者",
-    "違反", "依據", "依照", "按照", "揆諸", "適用", "觸犯", "牴觸", "前揭", "上開",
-    "依", "按",
-)
-
-#: 指稱性法名（非正式名稱）。cites 欄位應寫全名，寫這些等於失去追溯性。
-_IGNORABLE_LAW_NAMES = frozenset({"本法", "該法", "同法", "前法", "新法", "舊法", "母法", "此法"})
-
-#: 條號寫壞的樣式（「第15條之」缺數字、「第條」缺條號）——路線 A 語意檢索的典型殘留
-_MALFORMED_CITE_RE = re.compile(r"第\s*\d+\s*條\s*之\s*(?!\d)|第\s*條|§\s*(?!\d)")
 
 #: 民國/西元日期樣式
 _DATE_PATTERNS = (
@@ -253,8 +217,7 @@ def _check_article_number_format(paragraphs: list[dict]) -> dict:
         if _normalize_citation(c) is None:
             bad_format.append(c)
     for p in paragraphs:
-        for m in _MALFORMED_CITE_RE.finditer(p.get("text", "")):
-            malformed_text.append(_snippet(p.get("text", ""), m.start()))
+        malformed_text.extend(find_malformed(p.get("text", "")))
 
     problems = bad_format + malformed_text
     if problems:
@@ -510,10 +473,13 @@ def _declared_citations(paragraphs: list[dict]) -> set[str]:
 def _allowed_citations(recommended_laws: list[dict]) -> set[str]:
     """由可引用清單建白名單。
 
-    容錯處理三種形狀：
-      1. 已結構化：{"law": "洗錢防制法", "article": "22"} 或 {"citation": "..."}
+    容錯處理三種形狀（`recommend_laws` 結構化後走第 1 種，精確；其餘為後備）：
+      1. 已結構化：{"citation": "洗錢防制法第22條"} 或 {"law":..., "article":...}
       2. KB 原始 hit：{"text": "...", "metadata": {...}, "source": "..."}
       3. 純字串
+
+    注意：形狀 2 是從自由文字硬撈，可能撈進「不該引用但剛好被提到」的條文。
+    因此 `recommend_laws` 應輸出形狀 1，讓白名單精確可控。
     """
     allowed: set[str] = set()
     for item in recommended_laws or []:
@@ -523,14 +489,24 @@ def _allowed_citations(recommended_laws: list[dict]) -> set[str]:
         if not isinstance(item, dict):
             continue
 
+        # 形狀 1：已結構化，直接採用（精確路徑）
+        citation = item.get("citation")
+        if isinstance(citation, str) and citation:
+            norm = _normalize_citation(citation)
+            if norm:
+                allowed.add(norm)
+                continue
+
         law = str(item.get("law") or item.get("law_name") or "").strip()
         article = str(item.get("article") or item.get("article_no") or "").strip()
         if law and article:
             norm = _normalize_citation(f"{law}第{article}條" if article.isdigit() else f"{law}{article}")
             if norm:
                 allowed.add(norm)
+                continue
 
-        for key in ("citation", "cite", "title", "text", "content", "source"):
+        # 形狀 2/3：後備，從自由文字抽取
+        for key in ("cite", "title", "text", "content", "source"):
             val = item.get(key)
             if isinstance(val, str):
                 allowed |= _extract_citations(val)
@@ -542,87 +518,6 @@ def _allowed_citations(recommended_laws: list[dict]) -> set[str]:
                 if isinstance(val, str):
                     allowed |= _extract_citations(val)
     return allowed
-
-
-def _extract_citations(text: str) -> set[str]:
-    """從自由文字抽出所有條號引用，正規化後回傳。指稱性法名（本法/該法）略過。"""
-    out: set[str] = set()
-    for m in _CITE_RE.finditer(text or ""):
-        norm = _canonical(m)
-        if norm:
-            out.add(norm)
-    return out
-
-
-def _normalize_citation(cite: str) -> str | None:
-    """把單一引用字串正規化為「法名第N條[之M]」；無法解析回 None。
-
-    需自字串開頭匹配（允許後綴項/款），避免「第15條之2」被截成「第15條」。
-    指稱性法名（本法/該法）回 None——cites 應寫法規全名，否則失去追溯性。
-    """
-    m = _CITE_RE.match(cite.strip())
-    if not m:
-        return None
-    return _canonical(m)
-
-
-def _canonical(m: re.Match) -> str | None:
-    """由 regex match 組出正規化條號；指稱性法名回 None。"""
-    law = _clean_law_name(m.group("law"))
-    if not law or law in _IGNORABLE_LAW_NAMES:
-        return None
-    article = m.group("a1") or m.group("a2")
-    sub = m.group("s1") or m.group("s2")
-    base = f"{law}第{int(article)}條"
-    return f"{base}之{int(sub)}" if sub else base
-
-
-def _clean_law_name(raw: str) -> str:
-    """把 regex 抓到的法名字串收斂為正式法規名稱。
-
-    兩段策略：
-      1. 已登錄法規 → 最長後綴匹配（「訴願人違反洗錢防制法」→「洗錢防制法」）
-      2. 未登錄法規 → 切除最後一個主詞/動詞之後的部分（啟發式）
-
-    同時正規化異體字（汙→污、台→臺，架構 §4.3 第 3 點），讓白名單與草稿引用
-    即使寫法不同也能比對成功。
-    """
-    law = _normalize_variants(re.sub(r"\s+", "", raw or ""))
-    if not law:
-        return ""
-
-    matched = [k for k in KNOWN_LAWS if law.endswith(k)]
-    if matched:
-        return max(matched, key=len)
-
-    return _strip_leading_noise(law)
-
-
-def _normalize_variants(text: str) -> str:
-    """法規名稱異體字正規化：汙→污、台→臺。"""
-    return text.replace("汙", "污").replace("台", "臺")
-
-
-def _strip_leading_noise(law: str) -> str:
-    """未登錄法規的後備處理：切在最後一個主詞/動詞之後。
-
-    切點須留下至少 2 字，避免把「水污染防治法」這類短名切壞。
-    """
-    best = 0
-    for word in _LAW_NAME_CUT_WORDS:
-        idx = law.rfind(word)
-        if idx == -1:
-            continue
-        end = idx + len(word)
-        if end > best and len(law) - end >= 2:
-            best = end
-    return law[best:] if best else law
-
-
-def _snippet(text: str, pos: int, width: int = 12) -> str:
-    """取問題位置前後片段，供報告顯示證據。"""
-    start = max(0, pos - width)
-    return text[start:pos + width].replace("\n", " ")
 
 
 def _parse_date(value) -> date | None:
