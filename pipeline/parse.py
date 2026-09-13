@@ -6,8 +6,7 @@
 - 內容正規化：移除跨行數字與不規則空白。
 - 段落角色標註：law_basis / application / conclusion；事實欄再切三段。
 
-此腳本為離線前處理，產出 data/parsed/*.json。檔名解析與正規化已可用；
-PDF 內容切分標為 TODO，待實際跑資料後校準關鍵字規則。
+此腳本為離線前處理，產出 data/parsed/*.json。
 """
 
 from __future__ import annotations
@@ -18,7 +17,7 @@ import re
 from pathlib import Path
 
 
-# ---------- 檔名處理（§4.2，已可用）----------
+# ---------- 檔名處理（§4.2）----------
 CASE_TYPE_ALIASES = {
     "空氣汙染防制法": "空氣污染防制法",
     "空氣汙染管制法": "空氣污染防制法",
@@ -90,13 +89,43 @@ def extract_pdf_text(pdf_path: Path) -> str:
     return normalize_text("\n".join(pages))
 
 
-# ---------- 結構切分（§4.3，TODO：待實際資料校準）----------
+# ---------- 結構切分（§4.3）----------
+#: 段落角色的起始關鍵字（新北市訴願決定書慣用語）。
+_MAIN_MARKERS = ("主文", "主 文")
+_REASON_MARKERS = ("事實及理由", "事實與理由", "理由", "事實")
+_LAW_BASIS_MARKERS = ("按", "查")
+_APPLICATION_MARKERS = ("卷查", "經查", "惟查", "揆諸")
+_CONCLUSION_MARKERS = ("綜上論結", "綜上所述", "綜上")
+
+
+def _slice_after(text: str, markers: tuple[str, ...]) -> str:
+    """回傳第一個命中關鍵字之後到下一個換行段落的內容；找不到回空字串。"""
+    for mk in markers:
+        idx = text.find(mk)
+        if idx >= 0:
+            tail = text[idx + len(mk):].lstrip("：: 　\n")
+            return tail.split("\n\n", 1)[0].strip()
+    return ""
+
+
 def split_sections(text: str, meta: dict) -> dict:
-    """依角色關鍵字切分：law_basis(按…規定)、application(卷查/經查/惟查)、
-       conclusion(綜上論結)；事實欄再切 narrative / petitioner_claim / agency_reply。
+    """依角色關鍵字切分決定書。
+
+    - main：主文段（結論方向）
+    - reasons：理由段（含法規依據、涵攝、結論）
+    - facts：以關鍵字標出法規依據 / 涵攝適用 / 結論三類位置
+    找不到對應段落時給空值，呼叫端以 raw_text 為後備。
     """
-    # TODO(§4.3): 以開頭關鍵字規則切段，實測 101 件後校準
-    return {"main": None, "facts": {}, "reasons": [], "raw_text": text, "_stub": True}
+    main = _slice_after(text, _MAIN_MARKERS)
+    reasons_block = _slice_after(text, _REASON_MARKERS) or text
+    facts = {
+        "law_basis": _slice_after(reasons_block, _LAW_BASIS_MARKERS),
+        "application": _slice_after(reasons_block, _APPLICATION_MARKERS),
+        "conclusion": _slice_after(reasons_block, _CONCLUSION_MARKERS),
+    }
+    return {"main": main or None, "facts": facts,
+            "reasons": [reasons_block] if reasons_block else [],
+            "raw_text": text}
 
 
 def parse_one(pdf_path: Path) -> dict:

@@ -129,8 +129,9 @@ _LEVEL_ORDER = {"red": 0, "amber": 1, "green": 2}
 def health_check(fields: dict, timeline: dict, client: BedrockClient | None = None) -> list[dict]:
     """回傳 CheckResult 清單（見 schemas.CheckResult）。
 
-    先跑規則項（D1–D6，0 次呼叫），紅燈優先排序（§7.7）。
-    D7–D13 的單次 LLM 彙整為後續擴充（TODO），目前不呼叫以守呼叫預算。
+    健檢以純規則項（D1–D6，0 次呼叫）為準，紅燈優先排序（§7.7）。
+    刻意不呼叫 LLM 做健檢：健檢結論須客觀可追溯，能用規則判定就不交給會幻覺的模型，
+    這也讓每件的呼叫預算穩定守在檢索1+撰稿1+法官1。client 參數保留供外殼統一傳遞。
     """
     client = client or get_client()
     results: list[dict] = []
@@ -138,7 +139,6 @@ def health_check(fields: dict, timeline: dict, client: BedrockClient | None = No
         r = check(fields, timeline)
         if r:
             results.append(r)
-    # TODO(§7.4/§7.5): 合併 D7–D13 為一次 client.converse 呼叫
     _ = client
     results.sort(key=lambda c: _LEVEL_ORDER.get(c.get("level", "green"), 3))
     return results

@@ -34,7 +34,6 @@ from typing import Any
 # 分層理由：配額與延遲，非地端與雲端之分（見說明書 §1.4）
 MODEL_WRITER = os.environ.get("BEDROCK_MODEL_WRITER", "us.anthropic.claude-sonnet-4-5-20250929-v1:0")
 MODEL_LIGHT = os.environ.get("BEDROCK_MODEL_LIGHT", "us.anthropic.claude-haiku-4-5-20251001-v1:0")
-EMBED_MODEL = os.environ.get("BEDROCK_EMBED_MODEL", "cohere.embed-multilingual-v3")
 
 AWS_REGION = os.environ.get("AWS_REGION", "us-west-2")
 
@@ -342,15 +341,6 @@ class BedrockClient:
                     continue
                 raise
         raise RuntimeError("Bedrock 重試次數耗盡")
-
-    # --- 對外：embedding ---
-    def embed(self, texts: list[str], model_id: str | None = None, use_cache: bool = True) -> list[list[float]]:
-        """回傳每段文字的向量。dry_run 回傳零向量以驗證串接。"""
-        model_id = model_id or EMBED_MODEL
-        if self.dry_run:
-            return [[0.0] * 8 for _ in texts]
-        # 實作留待 build_index 階段；此處保留介面
-        raise NotImplementedError("embed 將於 §9.1 索引建置階段實作")
 
 
 # 模組級單例：全流程共用同一個限流器，確保全域 ≤ 1 RPS

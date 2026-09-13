@@ -313,14 +313,10 @@ def _parse_reasons(text: str) -> list[dict]:
 
 def _strip_code_fence(text: str) -> str:
     """去除 ```json ... ``` 圍籬與前後空白（Claude 常這樣包 JSON）。"""
-    import re
-    m = re.search(r"```(?:json)?\s*(\{.*\})\s*```", text, re.DOTALL)
+    m = _re.search(r"```(?:json)?\s*(\{.*\})\s*```", text, _re.DOTALL)
     if m:
         return m.group(1)
     return text.strip()
-
-
-import re as _re
 
 
 # ---------- 不受理理由模板（訴願法§77 各款，純模板，0 呼叫）----------
