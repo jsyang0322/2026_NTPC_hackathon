@@ -428,10 +428,6 @@ if st.session_state["step"] == 1:
                                       key="up_disposition")
     st.caption("　　原處分書提供處分機關、法令依據、送達日期等資訊；未提供時無法核算訴願期間與原處分瑕疵。")
 
-    up_reply = st.file_uploader("機關答辯書（PDF 或 純文字檔）　可選", type=["pdf", "txt"],
-                                key="up_reply")
-    st.caption("　　機關答辯書常於審理中始送達，未提供不影響流程。")
-
     with st.expander("或改用貼上文字（沒有檔案時）"):
         pasted_petition = st.text_area("訴願書全文", height=160, key="paste_petition")
 
@@ -439,7 +435,6 @@ if st.session_state["step"] == 1:
         # 1) 取文字：優先用上傳檔，否則用貼上的文字
         petition_txt = _read_upload(up_petition) if up_petition else (pasted_petition or "")
         disposition_txt = _read_upload(up_disposition) if up_disposition else ""
-        reply_txt = _read_upload(up_reply) if up_reply else ""
 
         if not petition_txt.strip():
             st.error("請至少提供訴願書（上傳檔案或貼上文字）。")
@@ -449,14 +444,11 @@ if st.session_state["step"] == 1:
                 petition_txt, _ = deidentify(petition_txt)
                 if disposition_txt:
                     disposition_txt, _ = deidentify(disposition_txt)
-                if reply_txt:
-                    reply_txt, _ = deidentify(reply_txt)
 
                 # 3) 原始文字 → 交接 JSON（intake：分類 0 呼叫 + 擷取 1 呼叫）
                 case_text = {
                     "petition": petition_txt,
                     "original_disposition_doc": disposition_txt,
-                    "agency_reply_doc": reply_txt,
                 }
                 payload = intake(case_text, client=get_client())
 

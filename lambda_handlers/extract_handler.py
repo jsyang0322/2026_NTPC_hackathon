@@ -31,7 +31,7 @@ def handler(event, context=None):
 
 def _test():
     from core.bedrock_client import get_client as gc
-    fields = extract_fields({"petition": "測試", "original_disposition_doc": "", "agency_reply_doc": ""},
+    fields = extract_fields({"petition": "測試", "original_disposition_doc": ""},
                             client=gc(dry_run=True))
     print(_s3io.dump(fields))
 

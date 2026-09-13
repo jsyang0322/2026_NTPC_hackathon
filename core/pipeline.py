@@ -79,8 +79,7 @@ def intake(case_text: dict, case_id: str = "", client=None,
     with_issues=True 時額外呼叫 tag_issues（+1 呼叫），預設關閉以守呼叫預算
     （主線 extract1+檢索1+撰稿1+法官1=4，重寫最壞6；開 issues 則各 +1）。
 
-    輸入 case_text: {"petition","original_disposition_doc"/"disposition",
-                     "agency_reply_doc"/"reply"}
+    輸入 case_text: {"petition","original_disposition_doc"/"disposition"}
     輸出: schemas 交接契約 payload（可直接餵 process_case）。
     """
     client = client or get_client()
@@ -114,8 +113,6 @@ def intake(case_text: dict, case_id: str = "", client=None,
         "petition": case_text.get("petition", "") or "",
         "original_disposition_doc": (case_text.get("disposition")
                                      or case_text.get("original_disposition_doc", "") or ""),
-        "agency_reply_doc": (case_text.get("reply")
-                             or case_text.get("agency_reply_doc", "") or ""),
     }
     return payload
 

@@ -10,7 +10,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field, asdict
 
 
-INPUT_SCHEMA_VERSION = "1.0"
+INPUT_SCHEMA_VERSION = "1.1"
 
 # route_key 英文枚舉（§7 交接約定）：中文名稱不當路由鍵，避免汙/污、防制/管制不一致
 ROUTE_KEYS = ("money_laundering", "waste", "air_pollution", "building", "noise", "general")
@@ -39,13 +39,11 @@ def build_empty_input() -> dict:
             "petition_filed_date": "",
             "requests": [],
             "claims": [],                 # [{id, summary, quote}]
-            "agency_reply": {"summary": "", "evidence_attached": False},
             "evidence_list": [],
         },
         "raw_text": {
             "petition": "",               # 訴願書全文（供 prompt）
             "original_disposition_doc": "",  # 原處分書全文（供 KB 檢索/對抗式審查）
-            "agency_reply_doc": "",
         },
     }
 

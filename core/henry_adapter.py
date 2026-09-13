@@ -164,7 +164,6 @@ def from_henry_output(henry_json: dict) -> dict:
     req = doc.get("訴願請求事項")
     ef["requests"] = [req] if req else []
     ef["claims"] = _split_claims(doc.get("理由") or "")
-    ef["agency_reply"] = {"summary": "", "evidence_attached": bool(doc.get("檢附證據"))}
     ef["evidence_list"] = []
     # 保留 henry 的成年/法人判定供追溯（procedure 77(4) 可參考）
     ef["_henry"] = {
@@ -177,6 +176,5 @@ def from_henry_output(henry_json: dict) -> dict:
     payload["raw_text"] = {
         "petition": full_text,      # henry 全文含事實+理由，供 KB 檢索與對抗式審查
         "original_disposition_doc": (doc.get("事實") or "") + "\n" + (doc.get("理由") or ""),
-        "agency_reply_doc": "",
     }
     return payload

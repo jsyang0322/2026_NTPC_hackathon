@@ -41,6 +41,12 @@ AWS_REGION = os.environ.get("AWS_REGION", "us-west-2")
 # 全專案共用的最小呼叫間隔（秒）。1.05 而非 1.0 是留安全邊際，實測約 0.95 RPS。
 MIN_INTERVAL = float(os.environ.get("BEDROCK_MIN_INTERVAL", "1.05"))
 
+# 全域關閉快取：BEDROCK_NO_CACHE=1 時，converse 整趟不讀也不寫 data/cache，
+# 強制每個 LLM 呼叫都真實發出——用於驗證「確實端到端真呼叫」或現場 demo。
+# 注意會犧牲 ≤1 RPS 下的速度（每次都真打），故預設關閉。
+def _no_cache() -> bool:
+    return os.environ.get("BEDROCK_NO_CACHE", "0") == "1"
+
 
 # ===========================================================================
 # 跨行程限流閘門
@@ -256,9 +262,17 @@ class BedrockClient:
 
     def _cache_get(self, key: str) -> dict | None:
         p = self._cache_path(key)
-        if p.exists():
-            return json.loads(p.read_text(encoding="utf-8"))
-        return None
+        if not p.exists():
+            return None
+        try:
+            data = json.loads(p.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return None
+        # 防呆：離線（dry-run）時寫下的假回應絕不當真結果回傳。
+        # 正常情況下這類檔案不會產生（見 converse），此處為相容舊快取的第二道防線。
+        if data.get("dry_run"):
+            return None
+        return data
 
     def _cache_put(self, key: str, value: dict) -> None:
         self._cache_path(key).write_text(
@@ -283,6 +297,8 @@ class BedrockClient:
         bedrock:InvokeModel，未授權 bedrock:Converse，Converse 會被 IAM 擋下。
         """
         model_id = model_id or MODEL_WRITER
+        # BEDROCK_NO_CACHE=1 全域強制關閉快取，優先於呼叫端的 use_cache。
+        use_cache = use_cache and not _no_cache()
         payload = {
             "model_id": model_id,
             "messages": messages,
@@ -298,10 +314,8 @@ class BedrockClient:
                 return cached["text"]
 
         if self.dry_run:
-            text = f"[DRY_RUN::{model_id}] 離線模式回應，未呼叫真實 Bedrock。"
-            if use_cache:
-                self._cache_put(key, {"text": text, "dry_run": True})
-            return text
+            # 離線 mock 一律不寫快取：避免假回應汙染快取、於日後真實執行被當真結果回傳。
+            return f"[DRY_RUN::{model_id}] 離線模式回應，未呼叫真實 Bedrock。"
 
         body = _build_invoke_body(model_id, messages, system, temperature, max_tokens)
         text = self._invoke_with_retry(model_id, body)

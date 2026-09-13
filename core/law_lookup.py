@@ -117,7 +117,6 @@ def _build_query(case_text: dict) -> str:
     parts = [
         str(case_text.get("original_disposition_doc", "") or case_text.get("disposition", "") or ""),
         str(case_text.get("petition", "") or ""),
-        str(case_text.get("agency_reply_doc", "") or case_text.get("reply", "") or ""),
     ]
     return "\n".join(p for p in parts if p).strip()
 

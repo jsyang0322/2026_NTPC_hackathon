@@ -79,11 +79,10 @@ _SYSTEM = (
 )
 
 
-def _build_prompt(petition: str, disposition_doc: str, agency_reply: str) -> str:
+def _build_prompt(petition: str, disposition_doc: str) -> str:
     return (
         "【訴願書】\n" + (petition or "（無）") + "\n\n"
         "【原處分書】\n" + (disposition_doc or "（無）") + "\n\n"
-        "【機關答辯書】\n" + (agency_reply or "（無）") + "\n\n"
         "請擷取並輸出以下 JSON（僅 JSON）：\n"
         "{\n"
         '  "petitioner": {"name": "訴願人姓名或名稱", "address": "地址", "agent": "代理人"},\n'
@@ -93,7 +92,6 @@ def _build_prompt(petition: str, disposition_doc: str, agency_reply: str) -> str
         '  "petition_filed_date": "提起訴願日期",\n'
         '  "requests": ["訴願人聲明請求，如 撤銷原處分"],\n'
         '  "claims": [{"id": "C1", "summary": "主張要旨（一句）", "quote": "原文摘句"}],\n'
-        '  "agency_reply": {"summary": "機關答辯要旨", "evidence_attached": true/false},\n'
         '  "evidence_list": ["證據名稱"]\n'
         "}\n"
         "規則：claims 逐項拆分並編號 C1, C2...；找不到的欄位給空字串或空陣列。"
@@ -121,7 +119,6 @@ def _empty_fields() -> dict:
         "petition_filed_date": "",
         "requests": [],
         "claims": [],
-        "agency_reply": {"summary": "", "evidence_attached": False},
         "evidence_list": [],
     }
 
@@ -149,13 +146,11 @@ def extract_fields(case_text: dict, client: BedrockClient | None = None) -> dict
     輸入 case_text（相容兩種 key 命名）：
       petition               訴願書全文
       disposition / original_disposition_doc  原處分書全文
-      reply / agency_reply_doc                機關答辯書
     輸出：schemas 的 extracted_fields 形狀純 dict（含來源標記 _source）。
     """
     client = client or get_client()
     petition = case_text.get("petition", "") or ""
     disposition_doc = case_text.get("disposition") or case_text.get("original_disposition_doc", "") or ""
-    agency_reply = case_text.get("reply") or case_text.get("agency_reply_doc", "") or ""
 
     fields = _empty_fields()
 
@@ -164,7 +159,7 @@ def extract_fields(case_text: dict, client: BedrockClient | None = None) -> dict
     fields["original_disposition"].update(reg)
 
     # 2) LLM 層（1 次呼叫）：理解型欄位
-    prompt = _build_prompt(petition, disposition_doc, agency_reply)
+    prompt = _build_prompt(petition, disposition_doc)
     text = client.converse(
         messages=[{"role": "user", "content": [{"text": prompt}]}],
         model_id=MODEL_LIGHT,
@@ -188,8 +183,6 @@ def extract_fields(case_text: dict, client: BedrockClient | None = None) -> dict
     if isinstance(data.get("requests"), list):
         fields["requests"] = [r for r in data["requests"] if r]
     fields["claims"] = _normalize_claims(data.get("claims"))
-    if isinstance(data.get("agency_reply"), dict):
-        fields["agency_reply"].update(data["agency_reply"])
     if isinstance(data.get("evidence_list"), list):
         fields["evidence_list"] = [e for e in data["evidence_list"] if e]
 
