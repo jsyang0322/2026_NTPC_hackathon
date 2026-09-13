@@ -20,6 +20,7 @@ import streamlit as st  # noqa: E402
 
 from core.pipeline import analyze_case, generate_case_draft, intake  # noqa: E402
 from core.bedrock_client import get_client  # noqa: E402
+from core.law_lookup import lookup_from_text  # noqa: E402
 from pipeline.kb_ingest_s3 import deidentify  # noqa: E402
 
 
@@ -41,13 +42,15 @@ def _read_upload(uploaded) -> str:
 
 
 # ============ 頁面設定 ============
-st.set_page_config(page_title="新北市訴願審查工作台", page_icon="⚖️", layout="wide")
+st.set_page_config(page_title="新北市訴願審查工作台", page_icon="⚖️", layout="wide",
+                   initial_sidebar_state="expanded")
 
 ROUTE_LABELS = {
     "money_laundering": "洗錢防制法", "waste": "廢棄物清理法",
     "air_pollution": "空氣污染防制法", "building": "建築法",
     "noise": "噪音管制法", "general": "通用（其他案由）",
 }
+
 
 # ============ 樣式（法制單位風格：深藍 #1a2a4a / 金 #b8860b）============
 st.markdown(
@@ -80,8 +83,26 @@ st.markdown(
       [data-testid="stDecoration"] { display:none !important; }
 
       /* ---- 側邊欄 ---- */
-      [data-testid="stSidebar"] { background:#f2ece0; border-right:1px solid var(--line); }
+      /* 強制顯示並展開，覆蓋窄視窗時的自動收合（Streamlit 1.63 在 layout=wide
+         視窗較窄時會自動收合側邊欄，導致看似「消失」）。 */
+      [data-testid="stSidebar"] {
+        background:#f2ece0; border-right:1px solid var(--line);
+        display:flex !important; visibility:visible !important;
+        transform:none !important;
+        min-width:260px !important; width:260px !important;
+        margin-left:0 !important;
+      }
+      [data-testid="stSidebar"][aria-expanded="false"] {
+        transform:none !important; margin-left:0 !important;
+      }
       [data-testid="stSidebar"] * { color:var(--ink) !important; }
+      /* 側邊欄固定展開，隱藏那顆點了無效的收合箭頭（<<），避免誤導。 */
+      [data-testid="stSidebarCollapseButton"],
+      [data-testid="stSidebarCollapsedControl"],
+      [data-testid="stSidebar"] [data-testid="stSidebarHeader"] button,
+      button[kind="headerNoPadding"] {
+        display:none !important;
+      }
 
       /* ---- 說明文字（caption）---- */
       .stCaption, [data-testid="stCaptionContainer"],
@@ -200,9 +221,36 @@ st.markdown(
 if "step" not in st.session_state:
     st.session_state["step"] = 1
 
+# 「法律查詢輔助」是獨立於審理進度主線的功能：以獨立 flag 控制主區域顯示，
+# 開啟時主區域切成查詢畫面，不佔用 step 狀態、不影響 分析→草稿 主線。
+if "law_lookup_mode" not in st.session_state:
+    st.session_state["law_lookup_mode"] = False
+
 
 def goto(step: int):
     st.session_state["step"] = step
+    st.session_state["law_lookup_mode"] = False  # 回主線時關閉查詢模式
+
+
+def open_law_lookup():
+    st.session_state["law_lookup_mode"] = True
+
+
+def close_law_lookup():
+    st.session_state["law_lookup_mode"] = False
+
+
+def reset_review():
+    """清除審理流程的所有狀態，回到第一階段，準備審理下一件。"""
+    for k in ("analysis", "draft_result"):
+        st.session_state.pop(k, None)
+    st.session_state["step"] = 1
+    st.session_state["law_lookup_mode"] = False
+
+
+def reset_law_lookup():
+    """清除法律小幫手的查詢結果，準備下一次查詢。"""
+    st.session_state.pop("law_lookup_result", None)
 
 
 STEP_NAMES = ["案件受理與分析", "決定書草稿"]
@@ -292,11 +340,80 @@ st.markdown(
 
 with st.sidebar:
     st.markdown("#### 📋 審理進度")
+    _in_main_line = not st.session_state["law_lookup_mode"]
     for i, name in enumerate(STEP_NAMES, start=1):
-        mark = "✅" if i < st.session_state["step"] else ("🔵" if i == st.session_state["step"] else "⚪")
+        if _in_main_line:
+            mark = "✅" if i < st.session_state["step"] else ("🔵" if i == st.session_state["step"] else "⚪")
+        else:
+            mark = "⚪"          # 查詢模式時主線不高亮
         st.markdown(f"{mark} 第 {i} 階段　{name}")
 
-render_steps(st.session_state["step"])
+    st.button("🔄 審理新案件", use_container_width=True, on_click=reset_review,
+              key="sb_reset_review")
+
+    st.markdown("---")
+    st.markdown("#### 💡 法律小幫手")
+    if st.session_state["law_lookup_mode"]:
+        st.button("◀ 返回審理流程", use_container_width=True, on_click=close_law_lookup)
+    else:
+        st.button("💡 開啟法律小幫手", use_container_width=True, on_click=open_law_lookup)
+
+# 主線步驟列僅在審理流程頁顯示（查詢模式為獨立功能，不顯示審理步驟列）
+if not st.session_state["law_lookup_mode"]:
+    render_steps(st.session_state["step"])
+
+
+# ============ 獨立功能：法律小幫手 ============
+# 與審理進度主線無關的獨立工具：使用者自行上傳/貼文字 → 自動判定案由（內部 classify）
+# → KB 檢索 1 次 + Haiku 綜合 1 次 → Markdown 呈現。不進草稿、不做引用校驗。
+if st.session_state["law_lookup_mode"]:
+    st.markdown("### 　💡 法律小幫手")
+    st.caption("上傳或貼上文件，查詢相關法規與相似歷史案例。")
+
+    ll_upload = st.file_uploader("文件（PDF 或 純文字檔）", type=["pdf", "txt"], key="ll_upload")
+    with st.expander("或改用貼上文字"):
+        st.text_area("案情或文件全文", height=160, key="ll_pasted")
+
+    if st.button("🔍 查詢相關法規與案例", type="primary", use_container_width=True):
+        # 只在按下按鈕時才讀檔（避免每次 rerun / 瀏覽器重新整理都讀上傳物件，
+        # 讀到已消耗或殘留的 uploader 會拋例外導致整頁空白）。
+        ll_text = ""
+        try:
+            if ll_upload is not None:
+                ll_text = _read_upload(ll_upload)
+        except Exception:                       # noqa: BLE001 — 讀檔失敗不應讓整頁崩潰
+            ll_text = ""
+        if not ll_text.strip():
+            ll_text = st.session_state.get("ll_pasted") or ""
+
+        if not ll_text.strip():
+            st.error("請先上傳文件或貼上文字。")
+        else:
+            with st.spinner("去識別化 → 檢索知識庫 → 綜合整理…"):
+                # 競賽規範：個資不得送進 AWS，檢索與 LLM 前先去識別化
+                safe_text, _ = deidentify(ll_text)
+                # route_key=None：由 lookup_from_text 內部以 classify 自動判定案由（0 呼叫）
+                st.session_state["law_lookup_result"] = lookup_from_text(
+                    {"petition": safe_text},
+                    client=get_client(),
+                )
+            st.rerun()
+
+    if "law_lookup_result" in st.session_state:
+        res = st.session_state["law_lookup_result"]
+        st.markdown(
+            f'<div class="law-card"><div class="badge gold">'
+            f'案由：{ROUTE_LABELS.get(res.get("route_key",""), res.get("route_key",""))}</div>'
+            f'<span style="margin-left:10px;color:var(--muted)">'
+            f'參考知識庫 {res.get("retrieved_count",0)} 筆檢索結果</span></div>',
+            unsafe_allow_html=True)
+        st.markdown(res.get("markdown", "") or "（無回覆）")
+
+        st.markdown("---")
+        st.button("🔄 重新查詢", use_container_width=True, on_click=reset_law_lookup,
+                  key="ll_reset")
+
+    st.stop()   # 查詢模式為獨立頁，不再往下渲染審理主線
 
 
 # ============ 第 1 階段：案件受理與分析 ============
@@ -461,4 +578,5 @@ elif st.session_state["step"] == 2:
         st.markdown("---")
         b1, _, b2 = st.columns([1, 2, 1])
         b1.button("◀ 上一步", use_container_width=True, on_click=goto, args=(1,))
-        b2.button("🔄 審理新案件", use_container_width=True, on_click=goto, args=(1,))
+        b2.button("🔄 審理新案件", use_container_width=True, on_click=reset_review,
+                  key="stage2_reset")
