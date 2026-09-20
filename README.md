@@ -8,7 +8,7 @@ Language / 語言：**繁體中文** | [English](README.en.md)
 
 > **使用與安全邊界：** 本系統是競賽原型，只能處理虛構或已完成去識別化的資料。輸出僅供法制人員複核，**不是自動核發決定書的系統，也不取代法律專業判斷**。
 
-[Demo 摘要](#demo-摘要) · [問題與價值](#問題與價值) · [核心能力](#核心能力) · [工作流](#實際工作流) · [3 分鐘 Demo](#3-分鐘-demo) · [快速開始](#快速開始) · [安全限制](#資料安全與競賽限制) · [已知限制](#已知限制)
+[Demo 摘要](#demo-摘要) · [問題與價值](#問題與價值) · [核心能力](#核心能力) · [工作流](#實際工作流) · [3 分鐘 Demo](#3-分鐘-demo) · [快速開始](#快速開始) · [安全限制](#資料安全與競賽限制)
 
 ## Demo 摘要
 
@@ -16,7 +16,7 @@ Language / 語言：**繁體中文** | [English](README.en.md)
 |---|---|
 | 主要入口 | Streamlit 二階段工作台：案件受理與分析 → 決定書草稿 |
 | 輸入 | 訴願書必填；原處分書建議提供；支援 PDF、TXT 與貼上文字 |
-| 分析結果 | 六案由分類、結構化欄位、程序判定、推薦法規、相似歷史案例與 D1–D6 健檢 |
+| 分析結果 | 三條專責案由＋共用路由分類、結構化欄位、程序判定、推薦法規、相似歷史案例與 D1–D6 健檢 |
 | 草稿結果 | 主文、事實及理由、救濟教示、V1–V10 報告、critic 意見與人工複核訊號 |
 | 可交付輸出 | 公文風格預覽與 PDF 下載 |
 | 本次文件驗證 | `compileall`、core dry-run、preflight、`pip check` 與 README 連結檢查均通過；未執行 live AWS probe |
@@ -38,7 +38,7 @@ Language / 語言：**繁體中文** | [English](README.en.md)
 |---|---|---|
 | 文件輸入 | Streamlit 支援訴願書與原處分書 PDF／TXT 上傳，也可直接貼上訴願內容 | 上傳狀態與二階段審理流程 |
 | 案件結構化 | Claude Haiku 4.5 擷取當事人、處分、日期、法源、請求、主張與證據等欄位 | 案由、程序狀態與後續檢索上下文 |
-| 六案由路由 | 洗錢防制、廢棄物、空氣污染、建築、噪音及通用案由 | 案由分類卡片 |
+| 三條專責案由＋共用路由 | 洗錢防制、廢棄物、空氣污染及通用案由 | 案由分類卡片 |
 | 程序與原處分健檢 | 純 Python 建立時間軸、判斷部分不受理事由，並執行 D1–D6 客觀瑕疵檢查 | 不受理提示或實體審查參考方向 |
 | RAG | 透過 Amazon Bedrock Knowledge Bases 分批檢索法規、函釋／判解與歷史決定書 | 推薦法規與可展開的相似決定 |
 | 決定書草稿 | Claude Sonnet 4.5 依案件事實、可引用法源、相似案例與健檢結果研擬主文及理由 | 主文、理由段落與救濟教示 |
@@ -52,7 +52,7 @@ Language / 語言：**繁體中文** | [English](README.en.md)
 ```mermaid
 flowchart TD
     A[訴願書與原處分書<br/>PDF / TXT / 貼上文字] --> B[Streamlit 去識別化]
-    B --> C[Haiku 欄位擷取<br/>規則式六案由分類]
+    B --> C[Haiku 欄位擷取<br/>規則式三條專責案由＋共用路由分類]
     C --> D[schema v1.1 驗證<br/>時間軸與程序審查]
     D --> E{程序不受理？}
     E -- 是 --> F[不受理理由模板<br/>不再呼叫模型]
@@ -261,7 +261,7 @@ python -m pipeline.kb_ingest_s3 \
 │   └── streamlit_app.py       # Demo UI、去識別化呼叫、草稿預覽與 PDF 下載
 ├── core/
 │   ├── bedrock_client.py      # 共用 Bedrock client、≤1 RPS、cache、retry
-│   ├── schemas.py             # schema v1.1 與六案由 route_key 契約
+│   ├── schemas.py             # schema v1.1 與三條專責案由＋共用 route_key 契約
 │   ├── classify.py            # 規則式案由分類
 │   ├── extract.py             # Haiku 結構化擷取
 │   ├── timeline.py            # 民國／西元日期與期限時間軸
@@ -296,10 +296,10 @@ python -m pipeline.kb_ingest_s3 \
 
 ## 輸入契約
 
-前後段以 `core/schemas.py` 的 schema v1.1 交接。六個合法路由鍵為：
+前後段以 `core/schemas.py` 的 schema v1.1 交接。三條專責案由加共用路由：
 
 ```python
-("money_laundering", "waste", "air_pollution", "building", "noise", "general")
+("money_laundering", "waste", "air_pollution", "general")
 ```
 
 主要入口：
@@ -340,17 +340,6 @@ python -m pip check
 ```
 
 `python -m scripts.preflight_check --probe` 會發出真實 AWS 請求，僅在已完成權限、模型與 KB 設定後使用。
-
-## 已知限制
-
-1. Streamlit 是目前唯一完整 Demo；Lambda／Step Functions 外殼尚未具備與主線等價的重寫、結果契約與分散式節流。
-2. 去識別化尚不是 core invariant；繞過 Streamlit 的呼叫端必須自行先遮罩並做殘留檢查。
-3. 時間軸會處理寄存送達與週末順延，但尚未內建國定假日日曆。
-4. V5 法規版本檢查介面已存在，但主線尚未提供 version database，因此目前會標示 skipped。
-5. 法律小幫手允許模型綜合自身知識，且不套用正式草稿的完整引用白名單驗證；其輸出僅供查詢參考。
-6. Knowledge Base ID 缺漏時會以 mock hit 降級；正式展示必須先跑 preflight。
-7. 真實 KB 品質、模型權限、IAM、S3 policy 與 ingestion 狀態仍需在目標 AWS 帳號個別驗證。
-8. 本系統為競賽原型；任何草稿在核發或對外使用前都必須由具權責人員審查。
 
 ## 延伸文件
 

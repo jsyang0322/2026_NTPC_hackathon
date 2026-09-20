@@ -8,7 +8,7 @@ Its core principle is: **review before drafting; keep deterministic checks out o
 
 > **Usage and safety boundary:** This is a hackathon prototype and may process only fictitious or properly de-identified data. Its outputs are drafts for authorized legal review; it **does not issue final decisions or replace professional legal judgment**.
 
-[Demo at a glance](#demo-at-a-glance) · [Problem and value](#problem-and-value) · [Capabilities](#key-capabilities) · [Workflow](#runtime-workflow) · [3-minute demo](#3-minute-demo) · [Quick start](#quick-start) · [Safety](#data-security-and-competition-constraints) · [Limitations](#known-limitations)
+[Demo at a glance](#demo-at-a-glance) · [Problem and value](#problem-and-value) · [Capabilities](#key-capabilities) · [Workflow](#runtime-workflow) · [3-minute demo](#3-minute-demo) · [Quick start](#quick-start) · [Safety](#data-security-and-competition-constraints)
 
 ## Demo at a glance
 
@@ -16,7 +16,7 @@ Its core principle is: **review before drafting; keep deterministic checks out o
 |---|---|
 | Main entry point | A two-stage Streamlit workbench: case intake and analysis → appeal-decision draft |
 | Input | A required petition and recommended original disposition; PDF, TXT, and pasted petition text are supported |
-| Analysis | Six-route classification, structured fields, procedure result, recommended laws, similar decisions, and D1–D6 findings |
+| Analysis | Three specialized routes plus a shared fallback route, structured fields, procedure result, recommended laws, similar decisions, and D1–D6 findings |
 | Draft result | Disposition, facts and reasoning, remedy notice, V1–V10 report, critic findings, and human-review signals |
 | Deliverable | Government-document-style preview and downloadable PDF |
 | Checks run for this revision | `compileall`, core dry-run, preflight, `pip check`, and README link checks passed; no live AWS probe was run |
@@ -38,7 +38,7 @@ Its core principle is: **review before drafting; keep deterministic checks out o
 |---|---|---|
 | Document input | Streamlit accepts petition and original-disposition PDF/TXT files, with direct petition text as an alternative | Upload state and the two-stage review flow |
 | Case structuring | Claude Haiku 4.5 extracts parties, dispositions, dates, legal bases, requests, claims, and evidence | Case route, procedure status, and retrieval context |
-| Six-route classification | Money laundering, waste disposal, air pollution, building, noise control, and a general fallback route | Classified case-type card |
+| Three specialized routes plus shared fallback | Money laundering, waste disposal, air pollution, and a general fallback route | Classified case-type card |
 | Procedural and defect checks | Pure Python builds the timeline, detects selected inadmissibility grounds, and runs D1–D6 objective defect checks | Inadmissibility notice or a reference direction for merits review |
 | RAG | Amazon Bedrock Knowledge Bases retrieves statutes, interpretations/judgments, and historical appeal decisions in separate batches | Recommended authorities and expandable similar decisions |
 | Decision drafting | Claude Sonnet 4.5 uses facts, permitted authorities, similar cases, and defect findings to draft the disposition and reasoning | Disposition, reasoning paragraphs, and remedy notice |
@@ -52,7 +52,7 @@ Its core principle is: **review before drafting; keep deterministic checks out o
 ```mermaid
 flowchart TD
     A[Petition and original disposition<br/>PDF / TXT / pasted text] --> B[De-identification in Streamlit]
-    B --> C[Haiku field extraction<br/>rule-based six-route classification]
+    B --> C[Haiku field extraction<br/>rule-based three-route plus shared fallback classification]
     C --> D[Schema v1.1 validation<br/>timeline and procedure check]
     D --> E{Procedurally inadmissible?}
     E -- Yes --> F[Inadmissibility template<br/>no further model call]
@@ -296,10 +296,10 @@ After conversion, the Bedrock Knowledge Base data source and ingestion job must 
 
 ## Input contract
 
-The two halves of the workflow exchange schema v1.1 payloads defined in `core/schemas.py`. The six valid route keys are:
+The two halves of the workflow exchange schema v1.1 payloads defined in `core/schemas.py`. The valid route keys are three specialized routes plus a shared fallback:
 
 ```python
-("money_laundering", "waste", "air_pollution", "building", "noise", "general")
+("money_laundering", "waste", "air_pollution", "general")
 ```
 
 Main entry points:
@@ -340,17 +340,6 @@ python -m pip check
 ```
 
 `python -m scripts.preflight_check --probe` sends real AWS requests. Use it only after configuring the intended account, models, permissions, and Knowledge Base.
-
-## Known limitations
-
-1. Streamlit is the only complete demo path. The Lambda/Step Functions shells do not yet provide equivalent rewrite behavior, result contracts, or distributed throttling.
-2. De-identification is not yet a core invariant; callers that bypass Streamlit must mask data and check for residual identifiers first.
-3. The timeline handles substituted service and weekend adjustment, but no public-holiday calendar is built in.
-4. The V5 legal-version interface exists, but the mainline does not supply a version database, so it is currently skipped.
-5. The legal research helper may synthesize from model knowledge and does not apply the formal drafting path's complete citation allowlist validation. Treat it as research assistance only.
-6. A missing Knowledge Base ID silently degrades to a mock hit; preflight is mandatory before a live demo.
-7. Real KB quality, model access, IAM, S3 policies, and ingestion state must be verified in the target AWS account.
-8. This is a hackathon prototype. Every draft requires review by an authorized person before issuance or external use.
 
 ## Further documentation
 
